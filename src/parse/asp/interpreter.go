@@ -1094,8 +1094,11 @@ func (s *scope) callObject(name string, obj pyObject, c *Call) pyObject {
 		s.Error("Non-callable object '%s' (is a %s)", name, obj.Type())
 	}
 
-	if ok := s.PushCall(f); ok {
-		defer s.PopCall()
+	// Push to callstack for custom functions
+	if f.callNative == nil {
+		if ok := s.PushCall(f); ok {
+			defer s.PopCall()
+		}
 	}
 
 	return f.Call(s, c)
