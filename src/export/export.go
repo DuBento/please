@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/thought-machine/please/src/cli/logging"
@@ -178,7 +179,7 @@ func (e *export) export(target *core.BuildTarget) {
 
 	// We want to export the package that made this subrepo available, but we still need to walk the target deps
 	// as it may depend on other subrepos or first party targets
-	if target.Subrepo != nil {
+	if target.Subrepo != nil && target.Subrepo.Target != nil {
 		log.Warningf("Subrepo: %v", target.Subrepo.Target)
 		e.export(target.Subrepo.Target)
 	} else if e.noTrim {
@@ -203,9 +204,21 @@ func (e *export) export(target *core.BuildTarget) {
 	}
 }
 
+func printMap(m map[string]map[core.BuildStatement]bool) {
+	fmt.Println("PrintMap")
+	keys := make([]string, 0, len(m))
+	for k := range m {
+			keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+			fmt.Println(k, m[k])
+	}
+}
 // writeBuildStatements writes the BUILD file statements to the export directory.
 func (e *export) writeBuildStatements() {
 	log.Warningf("Selected Statements: %v", e.selectedStatements)
+	printMap(e.selectedStatements)
 
 	for filename, stmtMap := range e.selectedStatements {
 		stmts := make([]core.BuildStatement, 0, len(stmtMap))
