@@ -537,7 +537,7 @@ func (s *scope) PushCall(f *pyFunc) bool {
 		label = s.parsingFor.label
 	}
 
-	log.Debug("PushCall ", f.name, s.filename,label, stmt, s.cursor)
+	log.Debug("PushCall %v", []interface{}{f.name, s.filename,label, stmt, s.cursor})
 
 	s.interpreter.callStack.Push(core.CallFrame{MethodName: f.name, Label: label, Statement: stmt})
 	return true
@@ -555,7 +555,7 @@ func (s *scope) CallStackSnapshot(name string) core.CallStack {
 	for _,v := range s.interpreter.callStack {
 		stack += fmt.Sprintf("\n\t%v", v)
 	}
-	log.Warningf("CallStack Snapshot for %s: %s", name, stack)
+	log.Debugf("CallStack Snapshot for %s: %s", name, stack)
 
 	return snapshot
 }
@@ -1095,7 +1095,7 @@ func (s *scope) callObject(name string, obj pyObject, c *Call) pyObject {
 	}
 
 	// Push to callstack for custom functions
-	if f.callNative == nil {
+	if f.nativeCode == nil {
 		if ok := s.PushCall(f); ok {
 			defer s.PopCall()
 		}
