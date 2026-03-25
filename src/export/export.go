@@ -4,6 +4,7 @@
 package export
 
 import (
+	"bytes"
 	"fmt"
 	iofs "io/fs"
 	"os"
@@ -58,7 +59,6 @@ func ToDir(state *core.BuildState, dir string, noTrim bool, targets []core.Build
 		e.export(state.Graph.TargetOrDie(target))
 	}
 
-	e.writeBuildStatements()
 
 	// Write any preloaded build defs as well; preloaded subincludes should be fine though.
 	for _, preload := range state.Config.Parse.PreloadBuildDefs {
@@ -66,6 +66,7 @@ func ToDir(state *core.BuildState, dir string, noTrim bool, targets []core.Build
 			log.Fatalf("Failed to copy preloaded build def %s: %s", preload, err)
 		}
 	}
+	e.writeBuildStatements()
 }
 
 func (e *export) exportPlzConf() {
@@ -190,7 +191,6 @@ func (e *export) export(target *core.BuildTarget) {
 		e.exportSources(target)
 	}
 
-
 	for _, dep := range target.Dependencies() {
 		e.export(dep)
 	}
@@ -208,13 +208,14 @@ func printMap(m map[string]map[core.BuildStatement]bool) {
 	fmt.Println("PrintMap")
 	keys := make([]string, 0, len(m))
 	for k := range m {
-			keys = append(keys, k)
+		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-			fmt.Println(k, m[k])
+		fmt.Println(k, m[k])
 	}
 }
+
 // writeBuildStatements writes the BUILD file statements to the export directory.
 func (e *export) writeBuildStatements() {
 	log.Warningf("Selected Statements: %v", e.selectedStatements)
@@ -235,37 +236,39 @@ func (e *export) writeBuildStatements() {
 }
 
 func (e *export) writeBuildFile(filename string, stmts []core.BuildStatement) {
-	log.Warningf("Writing file: %s", filename)
-	if err := fs.EnsureDir(filepath.Join(e.targetDir, filename)); err != nil {
-		log.Fatalf("failed to create directory for %s: %v", filename, err)
-	}
-	fw, err := os.Create(filepath.Join(e.targetDir, filename))
-	if err != nil {
-		log.Fatalf("failed to create BUILD file %s: %v", filename, err)
-	}
-	defer fw.Close()
+	log.Debugf("Writing file: %s", filename)
 
 	fr, err := os.Open(filename)
 	if err != nil {
-		// TODO ensure only visiting correct files and move Warn to Fatal
-		log.Warningf("failed to open file %s: %v", filename, err)
+		log.Fatalf("failed to open file original file: %v", err)
 		return
 	}
 	defer fr.Close()
 
+	frStat, err := fr.Stat()
+	if err != nil {
+		log.Fatalf("failed to get original file status: %v", err)
+	}
+
+	outputFile := filepath.Join(e.targetDir, filename)
+	if err := fs.EnsureDir(outputFile); err != nil {
+		log.Fatalf("failed to create output directory structure: %v", err)
+	}
+
+	stmtsContent := make([][]byte, 0, len(stmts))
 	for _, s := range stmts {
 		buff := make([]byte, s.Len())
 		_, err := fr.ReadAt(buff, int64(s.Start))
 		if err != nil {
-			log.Fatalf("failed to read BUILD file %s: %v", filename, err)
+			log.Fatalf("failed to read original BUILD file %s: %v", filename, err)
 		}
+		stmtsContent = append(stmtsContent, buff)
+	}
 
-		if _, err := fw.Write(buff); err != nil {
-			log.Fatalf("failed to write statement to %s: %v", filename, err)
-		}
-		if _, err := fmt.Fprintf(fw, "\n#%+v\n\n", s); err != nil {
-			log.Fatalf("failed to write newline to %s: %v", filename, err)
-		}
+	joined := bytes.Join(stmtsContent, []byte{'\n'})
+	joined = append(joined, '\n')
+	if err = os.WriteFile(outputFile, joined, frStat.Mode()); err != nil {
+		log.Fatalf("failed to write exported BUILD file to %s: %v", filename, err)
 	}
 }
 
