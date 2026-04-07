@@ -264,6 +264,8 @@ type BuildTarget struct {
 	// If true, the interactive progress display will try to infer the target's progress
 	// via some heuristics on its output.
 	showProgress atomic.Bool `name:"progress"`
+	// Metadata collected during parsing and interpreter steps
+	ParseMetadata ParseMetadata
 }
 
 // ExpectedBuildMetadataVersionTag is the version tag that the current Please version expects. If this doesn't match
@@ -295,6 +297,45 @@ type BuildMetadata struct {
 	// expected version above, Please will not use this cached metadata.
 	VersionTag int
 }
+
+type ParseMetadata struct {
+	// A call stack from the interpret step that generated this target.
+	CallStack CallStack
+}
+
+type CallStack []CallFrame
+
+func (cs *CallStack) Push(item CallFrame) {
+	*cs = append(*cs, item)
+}
+
+func (cs *CallStack) Pop() CallFrame {
+	if len(*cs) == 0 {
+		var zero CallFrame
+		return zero
+	}
+	item := (*cs)[len(*cs)-1]
+	*cs = (*cs)[:len(*cs)-1]
+	return item
+}
+
+type CallFrame struct {
+	MethodName string
+	Label      BuildLabel
+	Statement  BuildStatement
+}
+
+type BuildStatement struct {
+	Filename   string
+	Start int
+	End int
+}
+
+func (s BuildStatement) Len() int {
+	return s.End - s.Start
+}
+
+
 
 // A PreBuildFunction is a type that allows hooking a pre-build callback.
 type PreBuildFunction interface {
@@ -1969,6 +2010,25 @@ func (target *BuildTarget) NeedCoverage(state *BuildState) bool {
 		return false
 	}
 	return state.NeedCoverage && !target.Test.NoOutput && !target.Test.NoCoverage && !target.HasAnyLabel(state.Config.Test.DisableCoverage)
+}
+
+// RelatedTargets returns all the targets in the package that originate from the same Build Statement.
+func (target *BuildTarget) RelatedTargets(graph *BuildGraph) BuildTargets {
+	relatedTargets := make(BuildTargets, 0)
+	pkg := graph.PackageOrDie(target.Label)
+	for _, otherTarget := range pkg.AllTargets() {
+		if otherTarget.isRelated(target) {
+			relatedTargets = append(relatedTargets, otherTarget)
+		}
+	}
+	return relatedTargets
+}
+
+func (target *BuildTarget) isRelated(other *BuildTarget) bool {
+	if len(target.ParseMetadata.CallStack) == 0 || len(other.ParseMetadata.CallStack) == 0 {
+		return false
+	}
+	return target.ParseMetadata.CallStack[0].Statement == other.ParseMetadata.CallStack[0].Statement
 }
 
 // Parent finds the parent of a build target, or nil if the target is parentless.

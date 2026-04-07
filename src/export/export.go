@@ -4,14 +4,18 @@
 package export
 
 import (
+	"bytes"
+	"fmt"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
 
 	"github.com/thought-machine/please/src/cli/logging"
 	"github.com/thought-machine/please/src/core"
 	"github.com/thought-machine/please/src/fs"
-	"github.com/thought-machine/please/src/gc"
 	"github.com/thought-machine/please/src/parse"
 )
 
@@ -22,19 +26,21 @@ type export struct {
 	targetDir string
 	noTrim    bool
 
-	exportedTargets  map[core.BuildLabel]bool
-	exportedPackages map[string]bool
+	exportedTargets    map[core.BuildLabel]bool
+	exportedPackages   map[string]bool
+	selectedStatements map[string]map[core.BuildStatement]bool
 }
 
 // ToDir exports a set of targets to the given directory.
 // It dies on any errors.
 func ToDir(state *core.BuildState, dir string, noTrim bool, targets []core.BuildLabel) {
 	e := &export{
-		state:            state,
-		noTrim:           noTrim,
-		targetDir:        dir,
-		exportedPackages: map[string]bool{},
-		exportedTargets:  map[core.BuildLabel]bool{},
+		state:              state,
+		noTrim:             noTrim,
+		targetDir:          dir,
+		exportedPackages:   map[string]bool{},
+		exportedTargets:    map[core.BuildLabel]bool{},
+		selectedStatements: map[string]map[core.BuildStatement]bool{},
 	}
 
 	if err := os.MkdirAll(dir, fs.DirPermissions); err != nil {
@@ -47,14 +53,12 @@ func ToDir(state *core.BuildState, dir string, noTrim bool, targets []core.Build
 			e.export(state.Graph.TargetOrDie(includeLabel))
 		}
 	}
+
+	log.Warningf("Exporting selected targets: %v", targets)
 	for _, target := range targets {
 		e.export(state.Graph.TargetOrDie(target))
 	}
-	// Now write all the build files
-	packages := map[*core.Package]bool{}
-	for target := range e.exportedTargets {
-		packages[state.Graph.PackageOrDie(target)] = true
-	}
+
 
 	// Write any preloaded build defs as well; preloaded subincludes should be fine though.
 	for _, preload := range state.Config.Parse.PreloadBuildDefs {
@@ -62,33 +66,7 @@ func ToDir(state *core.BuildState, dir string, noTrim bool, targets []core.Build
 			log.Fatalf("Failed to copy preloaded build def %s: %s", preload, err)
 		}
 	}
-
-	if noTrim {
-		return // We have already exported the whole directory
-	}
-
-	for pkg := range packages {
-		if pkg.Name == parse.InternalPackageName {
-			continue // This isn't a real package to be copied
-		}
-		if pkg.Subrepo != nil {
-			continue // Don't copy subrepo BUILD files... they don't exist in our source tree
-		}
-		dest := filepath.Join(dir, pkg.Filename)
-		if err := fs.CopyFile(pkg.Filename, dest, 0); err != nil {
-			log.Fatalf("Failed to copy BUILD file %s: %s\n", pkg.Filename, err)
-		}
-		// Now rewrite the unused targets out of it
-		var victims []string
-		for _, target := range pkg.AllTargets() {
-			if !e.exportedTargets[target.Label] && !target.HasParent() {
-				victims = append(victims, target.Label.Name)
-			}
-		}
-		if err := gc.RewriteFile(state, dest, victims); err != nil {
-			log.Fatalf("Failed to rewrite BUILD file: %s\n", err)
-		}
-	}
+	e.writeBuildStatements()
 }
 
 func (e *export) exportPlzConf() {
@@ -99,7 +77,7 @@ func (e *export) exportPlzConf() {
 	for _, file := range profiles {
 		path := filepath.Join(e.targetDir, file)
 		if err := os.RemoveAll(path); err != nil {
-			log.Fatalf("failed to copy .plzconfig file %s: %v", file, err)
+			log.Fatalf("failed to remove .plzconfig file %s: %v", file, err)
 		}
 		if err := fs.CopyFile(file, path, 0); err != nil {
 			log.Fatalf("failed to copy .plzconfig file %s: %v", file, err)
@@ -116,6 +94,7 @@ func (e *export) exportSources(target *core.BuildTarget) {
 					if err := fs.RecursiveCopy(p, filepath.Join(e.targetDir, p), 0); err != nil {
 						log.Fatalf("Error copying file: %s\n", err)
 					}
+					log.Warning("Writing source file: %s", p)
 				}
 			}
 		}
@@ -129,8 +108,8 @@ var ignoreDirectories = map[string]bool{
 	".hg":     true,
 }
 
-// exportPackage exports the package BUILD file containing the given target and all sources
-func (e *export) exportPackage(target *core.BuildTarget) {
+// exportEntirePackage exports the package BUILD file containing the given target and all sources
+func (e *export) exportEntirePackage(target *core.BuildTarget) {
 	pkgName := target.Label.PackageName
 	if pkgName == parse.InternalPackageName {
 		return
@@ -169,31 +148,127 @@ func (e *export) exportPackage(target *core.BuildTarget) {
 	}
 }
 
+// selectBuildStatements exports BUILD statements that generate the build target.
+func (e *export) selectBuildStatements(target *core.BuildTarget) {
+	if target.Label.PackageName == parse.InternalPackageName {
+		return
+	}
+
+	log.Infof("Selecting Build stmts of %s with callstack:\n", target.Label.String())
+	for _, frame := range target.ParseMetadata.CallStack {
+		log.Infof("\t%v", frame)
+
+		if frame.Statement.Filename != "" && !strings.HasPrefix(frame.Statement.Filename, core.OutDir) {
+			if _, ok := e.selectedStatements[frame.Statement.Filename]; !ok {
+				e.selectedStatements[frame.Statement.Filename] = map[core.BuildStatement]bool{}
+			}
+			e.selectedStatements[frame.Statement.Filename][frame.Statement] = true
+		}
+		if frame.Statement.Filename == "" {
+			log.Warning("Package without filename %v", frame)
+		}
+	}
+}
+
 // export implements the logic of ToDir, but prevents repeating targets.
 func (e *export) export(target *core.BuildTarget) {
 	if e.exportedTargets[target.Label] {
 		return
 	}
+	log.Warningf("Exporting %v.\n", target.Label)
+	e.exportedTargets[target.Label] = true
+
 	// We want to export the package that made this subrepo available, but we still need to walk the target deps
 	// as it may depend on other subrepos or first party targets
-	if target.Subrepo != nil {
+	if target.Subrepo != nil && target.Subrepo.Target != nil {
+		log.Warningf("Subrepo: %v", target.Subrepo.Target)
 		e.export(target.Subrepo.Target)
 	} else if e.noTrim {
 		// Export the whole package, rather than trying to trim the package down to only the targets we need
-		e.exportPackage(target)
+		e.exportEntirePackage(target)
 	} else {
+		e.selectBuildStatements(target)
 		e.exportSources(target)
 	}
 
-	e.exportedTargets[target.Label] = true
 	for _, dep := range target.Dependencies() {
 		e.export(dep)
 	}
 	for _, subinclude := range e.state.Graph.PackageOrDie(target.Label).AllSubincludes(e.state.Graph) {
 		e.export(e.state.Graph.TargetOrDie(subinclude))
 	}
-	if parent := target.Parent(e.state.Graph); parent != nil && parent != target {
-		e.export(parent)
+
+	for _, otherTarget := range target.RelatedTargets(e.state.Graph) {
+		log.Warningf("Exporting Other %s", otherTarget)
+		e.export(otherTarget)
+	}
+}
+
+func printMap(m map[string]map[core.BuildStatement]bool) {
+	fmt.Println("PrintMap")
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Println(k, m[k])
+	}
+}
+
+// writeBuildStatements writes the BUILD file statements to the export directory.
+func (e *export) writeBuildStatements() {
+	log.Warningf("Selected Statements: %v", e.selectedStatements)
+	printMap(e.selectedStatements)
+
+	for filename, stmtMap := range e.selectedStatements {
+		stmts := make([]core.BuildStatement, 0, len(stmtMap))
+		for stmt := range stmtMap {
+			stmts = append(stmts, stmt)
+		}
+		// Sort statements by position to keep them in order
+		slices.SortFunc(stmts, func(a, b core.BuildStatement) int {
+			return a.Start - b.Start
+		})
+
+		e.writeBuildFile(filename, stmts)
+	}
+}
+
+func (e *export) writeBuildFile(filename string, stmts []core.BuildStatement) {
+	log.Debugf("Writing file: %s", filename)
+
+	fr, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("failed to open file original file: %v", err)
+		return
+	}
+	defer fr.Close()
+
+	frStat, err := fr.Stat()
+	if err != nil {
+		log.Fatalf("failed to get original file status: %v", err)
+	}
+
+	outputFile := filepath.Join(e.targetDir, filename)
+	if err := fs.EnsureDir(outputFile); err != nil {
+		log.Fatalf("failed to create output directory structure: %v", err)
+	}
+
+	stmtsContent := make([][]byte, 0, len(stmts))
+	for _, s := range stmts {
+		buff := make([]byte, s.Len())
+		_, err := fr.ReadAt(buff, int64(s.Start))
+		if err != nil {
+			log.Fatalf("failed to read original BUILD file %s: %v", filename, err)
+		}
+		stmtsContent = append(stmtsContent, buff)
+	}
+
+	joined := bytes.Join(stmtsContent, []byte{'\n'})
+	joined = append(joined, '\n')
+	if err = os.WriteFile(outputFile, joined, frStat.Mode()); err != nil {
+		log.Fatalf("failed to write exported BUILD file to %s: %v", filename, err)
 	}
 }
 
