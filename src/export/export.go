@@ -4,197 +4,44 @@
 package export
 
 import (
-	iofs "io/fs"
+	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+
+	"github.com/please-build/buildtools/build"
 
 	"github.com/thought-machine/please/src/cli/logging"
 	"github.com/thought-machine/please/src/core"
 	"github.com/thought-machine/please/src/fs"
-	"github.com/thought-machine/please/src/gc"
 	"github.com/thought-machine/please/src/parse"
+	"github.com/thought-machine/please/src/parse/asp"
 )
 
 var log = logging.Log
 
-type export struct {
-	state     *core.BuildState
-	targetDir string
-	noTrim    bool
-
-	exportedTargets  map[core.BuildLabel]bool
-	exportedPackages map[string]bool
+type Exporter interface {
+	PlzConfig()
+	Preloaded()
+	Targets(core.BuildLabels)
+	Target(target *core.BuildTarget)
+	WritePackageFiles()
 }
 
-// ToDir exports a set of targets to the given directory.
-// It dies on any errors.
-func ToDir(state *core.BuildState, dir string, noTrim bool, targets []core.BuildLabel) {
-	e := &export{
-		state:            state,
-		noTrim:           noTrim,
-		targetDir:        dir,
-		exportedPackages: map[string]bool{},
-		exportedTargets:  map[core.BuildLabel]bool{},
-	}
+// Repo export a new please repo including the targets and dependencies requested.
+func Repo(state *core.BuildState, dir string, noTrim bool, targets []core.BuildLabel) {
+	e := NewExporter(state, dir, noTrim)
 
+	// ensure output dir
 	if err := os.MkdirAll(dir, fs.DirPermissions); err != nil {
 		log.Fatalf("failed to create export directory %s: %v", dir, err)
 	}
 
-	e.exportPlzConf()
-	for _, target := range state.Config.Parse.PreloadSubincludes {
-		for _, includeLabel := range append(state.Graph.TransitiveSubincludes(target), target) {
-			e.export(state.Graph.TargetOrDie(includeLabel))
-		}
-	}
-	for _, target := range targets {
-		e.export(state.Graph.TargetOrDie(target))
-	}
-	// Now write all the build files
-	packages := map[*core.Package]bool{}
-	for target := range e.exportedTargets {
-		packages[state.Graph.PackageOrDie(target)] = true
-	}
-
-	// Write any preloaded build defs as well; preloaded subincludes should be fine though.
-	for _, preload := range state.Config.Parse.PreloadBuildDefs {
-		if err := fs.RecursiveCopy(preload, filepath.Join(dir, preload), 0); err != nil {
-			log.Fatalf("Failed to copy preloaded build def %s: %s", preload, err)
-		}
-	}
-
-	if noTrim {
-		return // We have already exported the whole directory
-	}
-
-	for pkg := range packages {
-		if pkg.Name == parse.InternalPackageName {
-			continue // This isn't a real package to be copied
-		}
-		if pkg.Subrepo != nil {
-			continue // Don't copy subrepo BUILD files... they don't exist in our source tree
-		}
-		dest := filepath.Join(dir, pkg.Filename)
-		if err := fs.CopyFile(pkg.Filename, dest, 0); err != nil {
-			log.Fatalf("Failed to copy BUILD file %s: %s\n", pkg.Filename, err)
-		}
-		// Now rewrite the unused targets out of it
-		var victims []string
-		for _, target := range pkg.AllTargets() {
-			if !e.exportedTargets[target.Label] && !target.HasParent() {
-				victims = append(victims, target.Label.Name)
-			}
-		}
-		if err := gc.RewriteFile(state, dest, victims); err != nil {
-			log.Fatalf("Failed to rewrite BUILD file: %s\n", err)
-		}
-	}
-}
-
-func (e *export) exportPlzConf() {
-	profiles, err := filepath.Glob(".plzconfig*")
-	if err != nil {
-		log.Fatalf("failed to glob .plzconfig files: %v", err)
-	}
-	for _, file := range profiles {
-		path := filepath.Join(e.targetDir, file)
-		if err := os.RemoveAll(path); err != nil {
-			log.Fatalf("failed to copy .plzconfig file %s: %v", file, err)
-		}
-		if err := fs.CopyFile(file, path, 0); err != nil {
-			log.Fatalf("failed to copy .plzconfig file %s: %v", file, err)
-		}
-	}
-}
-
-// exportSources exports any source files (srcs and data) for the rule
-func (e *export) exportSources(target *core.BuildTarget) {
-	for _, src := range append(target.AllSources(), target.AllData()...) {
-		if _, ok := src.Label(); !ok { // We'll handle these dependencies later
-			for _, p := range src.FullPaths(e.state.Graph) {
-				if !filepath.IsAbs(p) { // Don't copy system file deps.
-					if err := fs.RecursiveCopy(p, filepath.Join(e.targetDir, p), 0); err != nil {
-						log.Fatalf("Error copying file: %s\n", err)
-					}
-				}
-			}
-		}
-	}
-}
-
-var ignoreDirectories = map[string]bool{
-	"plz-out": true,
-	".git":    true,
-	".svn":    true,
-	".hg":     true,
-}
-
-// exportPackage exports the package BUILD file containing the given target and all sources
-func (e *export) exportPackage(target *core.BuildTarget) {
-	pkgName := target.Label.PackageName
-	if pkgName == parse.InternalPackageName {
-		return
-	}
-	if e.exportedPackages[pkgName] {
-		return
-	}
-	e.exportedPackages[pkgName] = true
-
-	pkgDir := filepath.Clean(pkgName)
-
-	err := filepath.WalkDir(pkgDir, func(path string, d iofs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if path != pkgDir && fs.IsPackage(e.state.Config.Parse.BuildFileName, path) {
-				return filepath.SkipDir // We want to stop when we find another package in our dir tree
-			}
-			if ignoreDirectories[d.Name()] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil // Ignore symlinks, which are almost certainly generated sources.
-		}
-		dest := filepath.Join(e.targetDir, path)
-		if err := fs.EnsureDir(dest); err != nil {
-			return err
-		}
-		return fs.CopyFile(path, dest, 0)
-	})
-	if err != nil {
-		log.Fatalf("failed to export package %s for %s: %v", pkgName, target.Label, err)
-	}
-}
-
-// export implements the logic of ToDir, but prevents repeating targets.
-func (e *export) export(target *core.BuildTarget) {
-	if e.exportedTargets[target.Label] {
-		return
-	}
-	// We want to export the package that made this subrepo available, but we still need to walk the target deps
-	// as it may depend on other subrepos or first party targets
-	if target.Subrepo != nil {
-		e.export(target.Subrepo.Target)
-	} else if e.noTrim {
-		// Export the whole package, rather than trying to trim the package down to only the targets we need
-		e.exportPackage(target)
-	} else {
-		e.exportSources(target)
-	}
-
-	e.exportedTargets[target.Label] = true
-	for _, dep := range target.Dependencies() {
-		e.export(dep)
-	}
-	for _, subinclude := range e.state.Graph.PackageOrDie(target.Label).AllSubincludes(e.state.Graph) {
-		e.export(e.state.Graph.TargetOrDie(subinclude))
-	}
-	if parent := target.Parent(e.state.Graph); parent != nil && parent != target {
-		e.export(parent)
-	}
+	e.PlzConfig()
+	e.Preloaded()
+	e.Targets(targets)
+	e.WritePackageFiles()
 }
 
 // Outputs exports the outputs of a target.
@@ -212,4 +59,413 @@ func Outputs(state *core.BuildState, dir string, targets []core.BuildLabel) {
 			}
 		}
 	}
+}
+
+// NewExporter creates a new exporter of a specific type based on the arguments.
+func NewExporter(state *core.BuildState, dir string, noTrim bool) Exporter {
+	base := baseExporter{
+		state:           state,
+		targetDir:       dir,
+		exportedTargets: map[*core.Package]map[core.BuildLabel]bool{},
+	}
+
+	if noTrim {
+		exporter := &NoTrimExporter{
+			baseExporter:     base,
+			exportedPackages: map[string]bool{},
+		}
+		exporter.impl = exporter
+		return exporter
+	} else {
+		exporter := &DefaultExporter{
+			baseExporter:         base,
+			requiredSubincludes:  map[*core.Package]map[core.BuildLabel]bool{},
+			preloadedSubincludes: map[core.BuildLabel]bool{},
+		}
+		exporter.impl = exporter
+		return exporter
+	}
+}
+
+// baseExporter provides common fields and methods of other exporters. A reference
+// to the concrete exporter implementation is included to be used in the common methods.
+type baseExporter struct {
+	state     *core.BuildState
+	targetDir string
+
+	exportedTargets map[*core.Package]map[core.BuildLabel]bool
+	impl            Exporter
+}
+
+// PlzConfig exports the repo configuration files.
+func (be *baseExporter) PlzConfig() {
+	profiles, err := filepath.Glob(".plzconfig*")
+	if err != nil {
+		log.Fatalf("failed to glob .plzconfig files: %v", err)
+	}
+	for _, file := range profiles {
+		targetPath := filepath.Join(be.targetDir, file)
+		if err := os.RemoveAll(targetPath); err != nil {
+			log.Fatalf("failed to remove .plzconfig file %s: %v", file, err)
+		}
+		if err := fs.CopyFile(file, targetPath, 0); err != nil {
+			log.Fatalf("failed to copy .plzconfig file %s: %v", file, err)
+		}
+	}
+}
+
+// Targets exports all targets for the given labels.
+func (be *baseExporter) Targets(labels core.BuildLabels) {
+	for _, l := range labels {
+		target := be.state.Graph.TargetOrDie(l)
+		be.impl.Target(target)
+	}
+}
+
+// Dependencies exports dependencies of a target.
+func (be *baseExporter) Dependencies(target *core.BuildTarget) {
+	deps := target.DeclaredDependencies()
+	log.Infof("Exporting dependencies of (%v): %v", target.Label, deps)
+	be.Targets(deps)
+}
+
+// Sources exports all files required by the target.
+func (be *baseExporter) Sources(target *core.BuildTarget) {
+	for _, src := range append(target.AllSources(), target.AllData()...) {
+		if _, ok := src.Label(); ok {
+			continue // These will be handled as dependencies later
+		}
+		for _, p := range src.Paths(be.state.Graph) {
+			if !filepath.IsAbs(p) { // Don't copy system file deps.
+				if err := fs.RecursiveCopy(p, filepath.Join(be.targetDir, p), 0); err != nil {
+					log.Fatalf("Error copying file: %s\n", err)
+				}
+				log.Infof("Writing exported source file: %s", p)
+			}
+		}
+	}
+}
+
+// checkFirstExport is a helper to ensure we only visit the same target once.
+func (be *baseExporter) checkFirstExport(pkg *core.Package, target *core.BuildTarget) bool {
+	if _, ok := be.exportedTargets[pkg]; !ok {
+		be.exportedTargets[pkg] = map[core.BuildLabel]bool{}
+	}
+	if be.exportedTargets[pkg][target.Label] {
+		return false
+	}
+	be.exportedTargets[pkg][target.Label] = true
+	return true
+}
+
+// DefaultExporter implements an exporter that trims packages to reach a minimal exported repo.
+type DefaultExporter struct {
+	baseExporter
+	requiredSubincludes  map[*core.Package]map[core.BuildLabel]bool
+	preloadedSubincludes map[core.BuildLabel]bool
+}
+
+// Preloaded exports the preloaded targets, build defs and subincludes. These preloads are usually
+// defined in the .plzexport config.
+func (e *DefaultExporter) Preloaded() {
+	// Write any preloaded build defs
+	for _, preload := range e.state.Config.Parse.PreloadBuildDefs {
+		if err := fs.RecursiveCopy(preload, filepath.Join(e.targetDir, preload), 0); err != nil {
+			log.Fatalf("Failed to copy preloaded build def %s: %s", preload, err)
+		}
+	}
+
+	for _, target := range e.state.Config.Parse.PreloadSubincludes {
+		targets := append(e.state.Graph.TransitiveSubincludes(target), target)
+		for _, t := range targets {
+			e.preloadedSubincludes[t] = true
+		}
+		e.Targets(targets)
+	}
+}
+
+// Target exports an individual target. This implementation will attempt to export a minimal repo
+// with only the required targets and statements.
+func (e *DefaultExporter) Target(target *core.BuildTarget) {
+	pkg := e.state.Graph.PackageOrDie(target.Label)
+	if e.checkFirstExport(pkg, target) == false {
+		return
+	}
+
+	// We want to export the package that made this subrepo available, but we still need to walk the
+	// target deps as it may depend on other subrepos or first party targets
+	if target.Subrepo != nil {
+		e.Target(target.Subrepo.Target)
+		e.Dependencies(target)
+		// TODO do we need to walk build statements or subincludes?
+		return
+	}
+
+	e.Subincludes(pkg, target)
+	e.BuildStatements(pkg, target)
+	e.Sources(target)
+	e.Dependencies(target)
+}
+
+// Subincludes exports the subincluded targets required to generate the target and selects them to
+// later be written to the package as statements.
+func (e *DefaultExporter) Subincludes(pkg *core.Package, target *core.BuildTarget) {
+	subincludes, err := pkg.FindRequiredSubincludes(target)
+	if err != nil {
+		log.Infof("No subincludes found, assuming non required.: %w", pkg.Name, err)
+		return
+	}
+
+	for _, subinclude := range subincludes {
+		// skip for preloaded subincludes
+		if e.preloadedSubincludes[subinclude] {
+			continue
+		}
+
+		if _, ok := e.requiredSubincludes[pkg]; !ok {
+			e.requiredSubincludes[pkg] = map[core.BuildLabel]bool{}
+		}
+		e.requiredSubincludes[pkg][subinclude] = true
+
+		e.Target(e.state.Graph.TargetOrDie(subinclude))
+	}
+}
+
+// BuildStatements exports BUILD statements that generate the build target.
+func (e *DefaultExporter) BuildStatements(pkg *core.Package, target *core.BuildTarget) {
+	if target.Label.PackageName == parse.InternalPackageName {
+		// TODO validate if we still need this
+		return
+	}
+
+	stmt, err := pkg.FindStatement(target)
+	if err != nil {
+		log.Fatalf("Failed to find statement in %s: %w", pkg.Name, err)
+	}
+
+	relatedTargets, err := pkg.FindRelatedTargets(stmt)
+	if err != nil {
+		log.Fatalf("Failed to lookup related targets for package %s: %w", pkg.Name, err)
+	}
+	log.Infof("Exporting related targets to (%v): %v", target.Label, relatedTargets)
+
+	for _, target := range relatedTargets {
+		e.Target(target)
+	}
+}
+
+// WritePackageFiles writes the trimmed BUILD files to the export directory.
+func (e *DefaultExporter) WritePackageFiles() {
+	for pkg := range e.exportedTargets {
+		if pkg.Subrepo != nil || pkg.Name == parse.InternalPackageName {
+			continue // Skip subrepos and internal packages
+		}
+
+		// filter
+		filteredBytes, err := e.FilterPackageFile(pkg)
+		if err != nil {
+			log.Fatalf("Failed to filter the build statements of package %s: %v", pkg.Label(), err)
+		}
+
+		// format
+		buildParser, err := build.ParseBuild(pkg.Filename, filteredBytes)
+		formattedBytes := build.Format(buildParser)
+
+		// write
+		file := e.OpenExportedPackageFile(pkg)
+		defer file.Close()
+		if _, err := file.Write(formattedBytes); err != nil {
+			log.Fatalf("Failed to write to exported BUILD file %s: %v", file.Name(), err)
+		}
+	}
+}
+
+// OpenExportedPackageFile creates a new package (BUILD) file in the exported dir.
+func (e *DefaultExporter) OpenExportedPackageFile(pkg *core.Package) *os.File {
+	filename := pkg.Filename
+	exportedFilename := filepath.Join(e.targetDir, filename)
+	f, err := fs.OpenDirFile(exportedFilename, os.O_CREATE|os.O_WRONLY, 0664)
+	if err != nil {
+		log.Fatalf("Failed to create and open exported BUILD file for %s: %v", exportedFilename, err)
+	}
+	return f
+}
+
+// FilterPackageFile filters the statements to be written to the exported BUILD file.
+func (e *DefaultExporter) FilterPackageFile(pkg *core.Package) ([]byte, error) {
+	p := asp.NewParserOnly()
+	parsedStmts, err := p.ParseFileOnly(pkg.Filename)
+	if err != nil {
+		log.Fatalf("Failed to parse original BUILD file: %v", err)
+	}
+
+	original, err := os.ReadFile(pkg.Filename)
+	if err != nil {
+		log.Fatalf("Failed to open original BUILD file: %v", err)
+	}
+
+	cursor := 0
+	var buffer bytes.Buffer
+	for _, stmt := range parsedStmts {
+		bStmt := asp.NewBuildStatement(stmt)
+
+		log.Debugf("Evaluating statement %s", original[bStmt.Start:bStmt.End])
+		// Write content that's between stmts (e.g. comments)
+		if cursor < bStmt.Start {
+			if _, err := buffer.Write(original[cursor:bStmt.Start]); err != nil {
+				return nil, err
+			}
+			cursor = bStmt.Start
+		}
+
+		if stmtLabels, ok := pkg.GetSubincludedLabels(bStmt); ok {
+			// Write filtered subincludes
+			subStmt := e.minimalSubincludeStatement(pkg, stmtLabels)
+			buffer.Write([]byte(subStmt))
+			log.Debugf("Decision: %s", subStmt)
+		} else if required, err := e.isRequiredStatement(pkg, bStmt); err == nil && !required {
+			// Don't write statements that generate targets we are not interested about
+			log.Debugf("Decision: <skip>")
+			// skip
+		} else {
+			// Write every other statement
+			if _, err := buffer.Write(original[bStmt.Start:bStmt.End]); err != nil {
+				return nil, err
+			}
+			log.Debugf("Decision: <write>")
+		}
+
+		cursor = bStmt.End
+	}
+
+	// Write the rest of the original file (non build targets)
+	if buffer.Write(original[cursor:]); err != nil {
+		return nil, err
+	}
+
+	return buffer.Bytes(), nil
+}
+
+// isRequiredStatement evaluates if the current build statement is required by the export.
+func (e *DefaultExporter) isRequiredStatement(pkg *core.Package, stmt *core.BuildStatement) (bool, error) {
+	targets, err := pkg.FindRelatedTargets(stmt)
+	if err != nil {
+		return false, err
+	}
+
+	required := slices.ContainsFunc(targets, func(target *core.BuildTarget) bool {
+		return e.exportedTargets[pkg][target.Label]
+	})
+	return required, nil
+}
+
+// minimalSubincludeStatement generates a subinclude statement containing only the required labels.
+func (e *DefaultExporter) minimalSubincludeStatement(pkg *core.Package, available core.BuildLabels) string {
+	required := e.requiredSubincludes[pkg]
+	var filteredLabels core.BuildLabels
+	for _, label := range available {
+		if required[label] {
+			filteredLabels = append(filteredLabels, label)
+		}
+	}
+
+	if len(filteredLabels) == 0 {
+		return ""
+	}
+
+	sort.Sort(filteredLabels)
+
+	call := &build.CallExpr{
+		X: &build.Ident{Name: "subinclude"},
+	}
+	for _, label := range filteredLabels {
+		call.List = append(call.List, &build.StringExpr{Value: label.ShortString(pkg.Label())})
+	}
+
+	return build.FormatString(call)
+}
+
+// NoTrimExporter implements an exporter that avoids trimming any packages by exporting all targets
+// and statements in a package.
+type NoTrimExporter struct {
+	baseExporter
+	exportedPackages map[string]bool
+}
+
+func (nte *NoTrimExporter) Preloaded() {
+	// Write any preloaded build defs
+	for _, preload := range nte.state.Config.Parse.PreloadBuildDefs {
+		if err := fs.RecursiveCopy(preload, filepath.Join(nte.targetDir, preload), 0); err != nil {
+			log.Fatalf("Failed to copy preloaded build def %s: %s", preload, err)
+		}
+	}
+
+	for _, target := range nte.state.Config.Parse.PreloadSubincludes {
+		targets := append(nte.state.Graph.TransitiveSubincludes(target), target)
+		nte.Targets(targets)
+	}
+}
+
+// Target exports an individual target. This implementation won't attempted any trimming, exporting
+// all targets and statements defined in the package.
+func (nte *NoTrimExporter) Target(target *core.BuildTarget) {
+	pkg := nte.state.Graph.PackageOrDie(target.Label)
+	if nte.checkFirstExport(pkg, target) == false {
+		return
+	}
+
+	// We want to export the package that made this subrepo available, but we still need to walk the target deps
+	// as it may depend on other subrepos or first party targets
+	if target.Subrepo != nil {
+		nte.Target(target.Subrepo.Target)
+		nte.Dependencies(target)
+		// TODO do we need to walk build statements or subincludes?
+		return
+	}
+
+	nte.Package(pkg)
+	nte.Subincludes(pkg, target)
+	nte.AllTargets(pkg)
+	nte.Sources(target)
+	nte.Dependencies(target)
+}
+
+// Package exports the package BUILD file.
+func (nte *NoTrimExporter) Package(pkg *core.Package) {
+	pkgName := pkg.Name
+	if pkgName == parse.InternalPackageName {
+		return
+	}
+	if nte.exportedPackages[pkgName] {
+		return
+	}
+	nte.exportedPackages[pkgName] = true
+
+	pkgFilename := pkg.Filename
+	exportedFilename := filepath.Join(nte.targetDir, pkgFilename)
+
+	if err := fs.CopyFile(pkgFilename, exportedFilename, 0); err != nil {
+		log.Fatalf("failed to export package %s: %v", pkgName, err)
+	}
+}
+
+// Subincludes exports the subincluded targets.
+func (nte *NoTrimExporter) Subincludes(pkg *core.Package, target *core.BuildTarget) {
+	subincludes := pkg.AllSubincludes(nte.state.Graph)
+	for _, subinclude := range subincludes {
+		nte.Target(nte.state.Graph.TargetOrDie(subinclude))
+	}
+}
+
+// AllTargets will export all the targets in the provided package.
+func (nte *NoTrimExporter) AllTargets(pkg *core.Package) {
+	for _, target := range pkg.AllTargets() {
+		nte.Target(target)
+	}
+}
+
+// WritePackageFiles in the NoTrimExporter doesn't require an implementation due to total copy
+// of BUILD file.
+func (nte *NoTrimExporter) WritePackageFiles() {
+	return
 }

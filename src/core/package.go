@@ -34,6 +34,8 @@ type Package struct {
 	targets map[string]*BuildTarget
 	// Set of output files from rules.
 	Outputs map[string]*BuildTarget
+	// Includes metadata from parsing the package BUILD file.
+	BuildFileMetadata BuildFileMetadata
 	// Protects access to above
 	mutex sync.RWMutex
 }
@@ -46,10 +48,11 @@ func NewPackage(name string) *Package {
 // NewPackageSubrepo constructs a new package with the given name and subrepo.
 func NewPackageSubrepo(name, subrepo string) *Package {
 	return &Package{
-		Name:        name,
-		SubrepoName: subrepo,
-		targets:     map[string]*BuildTarget{},
-		Outputs:     map[string]*BuildTarget{},
+		Name:              name,
+		SubrepoName:       subrepo,
+		targets:           map[string]*BuildTarget{},
+		Outputs:           map[string]*BuildTarget{},
+		BuildFileMetadata: *newBuildFileMetadata(),
 	}
 }
 
@@ -228,6 +231,59 @@ func (pkg *Package) verifyOutputs() []string {
 		}
 	}
 	return ret
+}
+
+// RegisterStatement maps a build statement to target in the package.
+func (pkg *Package) RegisterStatement(target *BuildTarget, stmt *BuildStatement) {
+	if stmt == nil {
+		log.Infof("Attempted to register empty build statement for package %s and target %s",
+			pkg.Name, target.String())
+		return
+	}
+	pkg.mutex.Lock()
+	defer pkg.mutex.Unlock()
+	pkg.BuildFileMetadata.RegisterStatementTarget(stmt, target)
+}
+
+// RegisterRequiredSubincludes maps the required subincludes to generate the target.
+func (pkg *Package) RegisterRequiredSubincludes(target *BuildTarget, subincludes BuildLabels) {
+	if len(subincludes) == 0 {
+		log.Infof("Attempted to register empty subinclude labels for package %s and target %s",
+			pkg.Name, target.String())
+		return
+	}
+
+	pkg.mutex.Lock()
+	defer pkg.mutex.Unlock()
+	pkg.BuildFileMetadata.RegisterRequiredSubinclude(target, subincludes)
+}
+
+// RegisterSubincludeStmt maps the subincludes build statement to the included targets.
+func (pkg *Package) RegisterSubincludeStmt(label BuildLabel, stmt *BuildStatement) {
+	pkg.mutex.Lock()
+	defer pkg.mutex.Unlock()
+	pkg.BuildFileMetadata.RegisterSubincludeStmt(label, stmt)
+}
+
+// FindStatement finds the build statement that generated the target.
+func (pkg *Package) FindStatement(target *BuildTarget) (*BuildStatement, error) {
+	return pkg.BuildFileMetadata.FindStatement(target)
+}
+
+// FindRelatedTargets finds all the targets related to the build statement.
+func (pkg *Package) FindRelatedTargets(stmt *BuildStatement) ([]*BuildTarget, error) {
+	return pkg.BuildFileMetadata.FindTargets(stmt)
+}
+
+// FindRequiredSubincludes finds the subincluded target labels required by the given target.
+func (pkg *Package) FindRequiredSubincludes(target *BuildTarget) (BuildLabels, error) {
+	return pkg.BuildFileMetadata.FindRequiredSubincludes(target)
+}
+
+// GetSubincludedLabels returns the labels subincluded by the given statement and true if it
+// is a subinclude.
+func (pkg *Package) GetSubincludedLabels(stmt *BuildStatement) (BuildLabels, bool) {
+	return pkg.BuildFileMetadata.GetSubincludedLabels(stmt)
 }
 
 // FindOwningPackages returns build labels corresponding to the packages that own each of the given files.

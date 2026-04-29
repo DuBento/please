@@ -304,12 +304,14 @@ type scope struct {
 	subincludeLabel *core.BuildLabel // If set, label of the subinclude we're currently interpreting
 	parsingFor      *parseTarget
 	parent          *scope
+	callerScope     *scope // caller local scope, nil if not in callstack
 	locals          pyDict
 	config          *pyConfig
 	globber         *fs.Globber
 	// True if this scope is for a pre- or post-build callback.
 	Callback bool
 	mode     core.ParseMode
+	cursor   *Statement // points to the statement currently being interpreted
 }
 
 // parseAnnotatedLabelInPackage similarly to parseLabelInPackage, parses the label contextualising it to the provided
@@ -426,6 +428,7 @@ func (s *scope) newScope(pkg *core.Package, mode core.ParseMode, filename string
 		config:      s.config,
 		Callback:    s.Callback,
 		mode:        mode,
+		cursor:      s.cursor,
 	}
 	if pkg != nil && pkg.Subrepo != nil && pkg.Subrepo.State != nil {
 		s2.state = pkg.Subrepo.State
@@ -525,6 +528,7 @@ func (s *scope) interpretStatements(statements []*Statement) pyObject {
 		}
 	}()
 	for _, stmt = range statements {
+		s.cursor = stmt
 		if stmt.FuncDef != nil {
 			s.Set(stmt.FuncDef.Name, newPyFunc(s, stmt.FuncDef))
 		} else if stmt.If != nil {
@@ -1077,10 +1081,49 @@ func (s *scope) Constant(expr *Expression) pyObject {
 	return nil
 }
 
+// CurrentBuildStatement creates a new BuildStatement from the statement that is being currently interpreted.
+func (s *scope) CurrentBuildStatement() *core.BuildStatement {
+	stmtScope := s
+	for curr := s; curr != nil; curr = curr.callerScope {
+		if curr.pkg != nil && curr.filename == s.pkg.Filename {
+			stmtScope = curr
+		}
+	}
+	s.NAssert(stmtScope.cursor == nil, "Cursor is not pointing to a statement")
+	return NewBuildStatement(stmtScope.cursor)
+}
+
+// ActiveSubincludes traces the call stack and scopes to find subincludes that provided the
+// macros/functions actively executing to define this target.
+func (s *scope) ActiveSubincludes() []core.BuildLabel {
+	var subincludes []core.BuildLabel
+	seen := map[core.BuildLabel]bool{}
+	for curr := s; curr != nil; curr = curr.callerScope {
+		for localScope := curr; localScope != nil; localScope = localScope.parent {
+			if localScope.subincludeLabel != nil {
+				label := *localScope.subincludeLabel
+				if !seen[label] {
+					seen[label] = true
+					subincludes = append(subincludes, label)
+				}
+			}
+		}
+	}
+	return subincludes
+}
+
 // pkgFilename returns the filename of the current package, or the empty string if there is none.
 func (s *scope) pkgFilename() string {
 	if s.pkg != nil {
 		return s.pkg.Filename
 	}
 	return ""
+}
+
+// NewBuildStatement creates a new core.BuildStatment from an asp.statment.
+func NewBuildStatement(stmt *Statement) *core.BuildStatement {
+	return &core.BuildStatement{
+		Start: int(stmt.Pos),
+		End:   int(stmt.EndPos),
+	}
 }
