@@ -4,7 +4,6 @@
 package export
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -241,7 +240,7 @@ func (e *defaultExporter) ExportTarget(target *core.BuildTarget) {
 func (e *defaultExporter) WritePackageFiles() {
 	for pkgLabel := range e.visitedPackages {
 		pkg := e.state.Graph.PackageOrDie(pkgLabel)
-		filteredBytes, err := e.filterPackageFile(pkg)
+		filteredBytes, err := e.trimPackage(pkg)
 		if err != nil {
 			log.Errorf("Failed to filter the build statements of package %s: %v", pkg.Label(), err)
 			continue
@@ -249,7 +248,7 @@ func (e *defaultExporter) WritePackageFiles() {
 
 		parsedBuild, err := build.ParseBuild(pkg.Filename, filteredBytes)
 		if err != nil {
-			log.Fatalf("Failed to parse bytes for formatting: %v", err)
+			log.Fatalf("Failed to parse bytes for formatting: %v\n%s", err, filteredBytes)
 		}
 		formattedBytes := build.Format(parsedBuild)
 
@@ -312,83 +311,187 @@ func (e *defaultExporter) WriteExportedPackageFile(pkg *core.Package, content []
 	}
 }
 
-// filterPackageFile filters the statements to be written to the exported BUILD file.
-func (e *defaultExporter) filterPackageFile(pkg *core.Package) ([]byte, error) {
+// trimPackage filters the statements to be written to the exported BUILD file.
+func (e *defaultExporter) trimPackage(pkg *core.Package) ([]byte, error) {
 	p := asp.NewParserOnly()
-	parsedStmts, err := p.ParseFileOnly(pkg.Filename)
+	parsed, err := p.ParseFileOnly(pkg.Filename)
 	if err != nil {
 		return nil, fmt.Errorf("Parsing original BUILD file: %v", err)
 	}
 
-	original, err := os.ReadFile(pkg.Filename)
+	content, err := os.ReadFile(pkg.Filename)
 	if err != nil {
 		return nil, fmt.Errorf("Opening original BUILD file: %v", err)
 	}
 
-	cursor := 0
-	var buffer bytes.Buffer
-	for _, stmt := range parsedStmts {
-		bStmt := asp.NewBuildStatement(stmt)
+	trimmer := trimmer{
+		origin:   content,
+		pkg:      pkg,
+		exporter: e,
+		// assuming max len of the original file to avoid reallocations.
+		bytes: make([]byte, 0, len(content)),
+	}
+	trimmer.trimBlock(parsed, 0, asp.Position(len(content)))
 
-		log.Debugf("Evaluating statement %s", original[bStmt.Start:bStmt.End])
+	return trimmer.bytes, nil
+}
+
+// trimmer implements the filtering logic for statements in package files.
+type trimmer struct {
+	// origin are the bytes from the original package file.
+	origin []byte
+	// pkg references the package being trimmed.
+	pkg *core.Package
+	// bytes contain the content to be written after the trimming process.
+	bytes []byte
+	// exporter is used to lookup target related data from the export process, e.g. which targets are
+	// required.
+	exporter *defaultExporter
+}
+
+// trimBlock visits all the statements in a block and trims undesired statements.
+func (t *trimmer) trimBlock(stmts []*asp.Statement, blockStart, blockEnd asp.Position) {
+	// cursor tracks the position in a block that's being interpreted.
+	cursor := blockStart
+	for _, stmt := range stmts {
+
+		log.Debugf("Evaluating statement %s", t.origin[stmt.Pos:stmt.EndPos])
 		// Write content that's between stmts (e.g. comments). We skip these while parsing so it won't
 		// be included in "parsedStmts" but we want the resulting BUILD file to include these.
-		if cursor < bStmt.Start {
-			if _, err := buffer.Write(original[cursor:bStmt.Start]); err != nil {
-				return nil, err
-			}
+		if cursor < stmt.Pos {
+			t.bytes = append(t.bytes, t.origin[cursor:stmt.Pos]...)
 		}
 
-		if stmtLabels := pkg.Metadata.GetSubincludedLabels(&bStmt); len(stmtLabels) > 0 {
-			// Write filtered subincludes
-			subStmt := e.minimalSubincludeStatement(pkg, stmtLabels)
-			buffer.Write([]byte(subStmt))
-			log.Debugf("Decision: %s", subStmt)
-		} else if e.shouldSkipStatement(pkg, &bStmt) {
-			// Don't write statements that generate targets we are not interested about
-			log.Debugf("Decision: <skip>")
-		} else {
-			// Write every other statement
-			if _, err := buffer.Write(original[bStmt.Start:bStmt.End]); err != nil {
-				return nil, err
+		if stmt.If != nil {
+			t.trimIf(stmt)
+		} else if stmt.For != nil {
+			t.trimFor(stmt)
+		} else if stmt.Ident != nil && stmt.Ident.Name == "subinclude" {
+			t.trimSubinclude(stmt)
+		} else if relatives := t.relatedTargets(stmt); len(relatives) > 0 {
+			// Meaning it is a build statement that generated/builds build targets.
+			if t.anyExported(relatives) {
+				t.bytes = append(t.bytes, t.origin[stmt.Pos:stmt.EndPos]...)
 			}
-			log.Debugf("Decision: <write>")
+		} else {
+			// Write every other statement.
+			// If the statement didn't generate any targets (e.g. variable assignments, package() calls),
+			// we keep it to ensure the BUILD file remains valid.
+			t.bytes = append(t.bytes, t.origin[stmt.Pos:stmt.EndPos]...)
 		}
 
 		// Move the cursor to the end of the processed statement. The cursor will enable writing of lines
 		// that are not considered statements by the parser (e.g. comments, new lines).
-		cursor = bStmt.End
+		cursor = stmt.EndPos
 	}
 
 	// Write the rest of the original file (non build targets)
-	if _, err := buffer.Write(original[cursor:]); err != nil {
-		return nil, err
-	}
-
-	return buffer.Bytes(), nil
+	t.bytes = append(t.bytes, t.origin[cursor:blockEnd]...)
 }
 
-// shouldSkipStatement evaluates if the current build statement should be skipped during export.
-// We skip statements that generated build targets, but none of those targets are required by the export.
-func (e *defaultExporter) shouldSkipStatement(pkg *core.Package, stmt *core.BuildStatement) bool {
-	targets := pkg.Metadata.FindTargets(stmt)
-	if len(targets) == 0 {
-		// If the statement didn't generate any targets (e.g. variable assignments, package() calls),
-		// we keep it to ensure the BUILD file remains valid.
-		return false
+// trimIf will trim an if-else statement by exporting only the required targets, but keeping the
+// if-else primitive -- a implementation decision to help understand the changes caused by an export
+// when using a source-control management (SCM) system.
+func (t *trimmer) trimIf(stmt *asp.Statement) {
+	type block struct {
+		start asp.Position
+		stmts []*asp.Statement
 	}
 
+	blocks := []block{
+		{start: stmt.If.HeaderEndPos, stmts: stmt.If.Statements},
+	}
+	for _, elif := range stmt.If.Elif {
+		blocks = append(blocks, block{start: elif.HeaderEndPos, stmts: elif.Statements})
+	}
+	if len(stmt.If.ElseStatements) > 0 {
+		blocks = append(blocks, block{start: stmt.If.ElseHeaderEndPos, stmts: stmt.If.ElseStatements})
+	}
+
+	var blockFound bool
+	for i, b := range blocks {
+		end := stmt.EndPos
+		if i+1 < len(blocks) {
+			end = blocks[i+1].start
+		}
+
+		// In an if-else statement only the evaluated block will generate targets. We lookup generated
+		// targets in the package metadata and visit/trim the block the first block we find targets in
+		// (if-else is mutually exclusive, only one block is interpreted).
+		if !blockFound {
+			for _, stmt := range b.stmts {
+				if len(t.relatedTargets(stmt)) > 0 {
+					t.trimBlock(b.stmts, b.start, end)
+					blockFound = true
+					break
+				}
+			}
+			if blockFound {
+				continue
+			}
+		}
+
+		t.writeNonStatements(b.stmts, b.start, end)
+	}
+}
+
+func (t *trimmer) trimFor(stmt *asp.Statement) {
+	// TODO
+}
+
+func (t *trimmer) trimSubinclude(stmt *asp.Statement) {
+	bStmt := asp.NewBuildStatement(stmt)
+	stmtLabels := t.pkg.Metadata.GetSubincludedLabels(&bStmt)
+	subStmt := t.minimalSubincludeStatement(stmtLabels)
+	t.bytes = append(t.bytes, []byte(subStmt)...)
+}
+
+// writeNonStatements method trims all the statements and keeps the rest of the formatting, i.e.
+// comments and newlines. The method will write a single "pass" primitive in order to create valid
+// empty blocks.
+func (t *trimmer) writeNonStatements(stmts []*asp.Statement, blockStart, blockEnd asp.Position) {
+	// cursor tracks the position in a block that's being interpreted.
+	cursor := blockStart
+	var passWritten bool
+	for _, stmt := range stmts {
+
+		// Write content that's between stmts (e.g. comments). We skip these while parsing so it won't
+		// be included in "parsedStmts" but we want the resulting BUILD file to include these.
+		if cursor < stmt.Pos {
+			t.bytes = append(t.bytes, t.origin[cursor:stmt.Pos]...)
+		}
+
+		// When the trim results in an empty block, i.e. no statement are written, we write the "pass"
+		// primitive. This is useful when parsing inner blocks (e.g. if-else stmts).
+		if !passWritten {
+			t.bytes = append(t.bytes, []byte("pass  #Trimmed during export")...)
+		}
+
+		// Move the cursor to the end of the processed statement. The cursor will enable writing of lines
+		// that are not considered statements by the parser (e.g. comments, new lines).
+		cursor = stmt.EndPos
+	}
+
+	// Write the rest of the original file (non build targets)
+	t.bytes = append(t.bytes, t.origin[cursor:blockEnd]...)
+}
+
+func (t *trimmer) relatedTargets(stmt *asp.Statement) []*core.BuildTarget {
+	bStmt := asp.NewBuildStatement(stmt)
+	return t.pkg.Metadata.FindTargets(&bStmt)
+}
+
+func (t *trimmer) anyExported(targets []*core.BuildTarget) bool {
 	required := slices.ContainsFunc(targets, func(target *core.BuildTarget) bool {
-		return e.exportedTargets[target.Label]
+		return t.exporter.exportedTargets[target.Label]
 	})
-	// Skip if it generated targets, but none of them are required.
-	return !required
+	return required
 }
 
 // minimalSubincludeStatement generates a subinclude statement containing only the required labels.
-func (e *defaultExporter) minimalSubincludeStatement(pkg *core.Package, available core.BuildLabels) string {
+func (t *trimmer) minimalSubincludeStatement(available core.BuildLabels) string {
 	var filteredLabels core.BuildLabels
-	for _, required := range e.requiredSubincludes[pkg.Label()] {
+	for _, required := range t.exporter.requiredSubincludes[t.pkg.Label()] {
 		if slices.Contains(available, required) {
 			filteredLabels = append(filteredLabels, required)
 		}
@@ -404,7 +507,7 @@ func (e *defaultExporter) minimalSubincludeStatement(pkg *core.Package, availabl
 		X: &build.Ident{Name: "subinclude"},
 	}
 	for _, label := range filteredLabels {
-		call.List = append(call.List, &build.StringExpr{Value: label.ShortString(pkg.Label())})
+		call.List = append(call.List, &build.StringExpr{Value: label.ShortString(t.pkg.Label())})
 	}
 
 	return build.FormatString(call)

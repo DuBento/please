@@ -2,6 +2,7 @@ package export
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -52,8 +53,12 @@ func TestMinimalSubincludeStatement(t *testing.T) {
 
 			pkg := &core.Package{Name: "test"}
 			e.requiredSubincludes[pkg.Label()] = tc.requiredLabels
+			trimmer := trimmer{
+				pkg:      pkg,
+				exporter: e,
+			}
 
-			assert.Equal(t, tc.out, e.minimalSubincludeStatement(pkg, tc.availableLabels))
+			assert.Equal(t, tc.out, trimmer.minimalSubincludeStatement(tc.availableLabels))
 		})
 	}
 }
@@ -94,22 +99,7 @@ func TestFilterPackageFile(t *testing.T) {
 
 	pkg := core.NewPackage("test", core.WithPackageMetadata())
 	pkg.Filename = contentPath
-
-	// stmtIndices maps target names to their statement index in filter.build
-	stmtIndices := map[string]int{
-		"a": 2,
-		"b": 3,
-	}
-
-	targetLabels := map[string]core.BuildLabel{}
-	for name, index := range stmtIndices {
-		label := core.NewBuildLabel("test", name)
-		targetLabels[name] = label
-		target := &core.BuildTarget{Label: label}
-		pkg.Metadata.RegisterStatementTarget(target, func() core.BuildStatement {
-			return asp.NewBuildStatement(statements[index])
-		})
-	}
+	targetLabels := walkASTRegisterTargets(t, statements, pkg)
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,7 +109,7 @@ func TestFilterPackageFile(t *testing.T) {
 			}
 			e.visitedPackages[pkg.Label()] = true
 
-			got, err := e.filterPackageFile(pkg)
+			got, err := e.trimPackage(pkg)
 			assert.NoError(t, err)
 
 			expected, err := os.ReadFile(tc.expected)
@@ -127,4 +117,90 @@ func TestFilterPackageFile(t *testing.T) {
 			assert.Equal(t, string(expected), string(got))
 		})
 	}
+}
+
+func TestTrimIf(t *testing.T) {
+	testCases := []struct {
+		name     string
+		content  string
+		required []string
+		expected string
+	}{
+		{
+			name: "Keep target in if",
+			content: `if True:
+    genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
+`,
+			required: []string{"a"},
+			expected: `
+if True:
+  genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
+`,
+		},
+		{
+			name: "Target not required - all statements trimmed",
+			content: `if True:
+    genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
+`,
+			required: []string{},
+			expected: ``, // empty, all statements pruned
+		},
+		{
+			name: "Required target in elif",
+			content: `if False:
+    genrule(name = "a")
+elif True:
+    genrule(name = "b")
+else:
+    genrule(name = "c")
+`,
+			required: []string{"b"},
+			expected: `genrule(name = "b")`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := asp.NewParserOnly()
+			statements, err := p.ParseData([]byte(tc.content), "BUILD")
+			assert.NoError(t, err)
+
+			pkg := core.NewPackage("test", core.WithPackageMetadata())
+			pkg.Filename = "BUILD"
+
+			targetLabels := walkASTRegisterTargets(t, statements, pkg)
+			e := newExporter(nil, "", false).(*defaultExporter)
+			for _, name := range tc.required {
+				e.exportedTargets[targetLabels[name]] = true
+			}
+
+			trimmer := &trimmer{
+				origin:   []byte(tc.content),
+				pkg:      pkg,
+				exporter: e,
+			}
+			trimmer.trimBlock(statements, 0, asp.Position(len(tc.content)))
+
+			assert.Equal(t, tc.expected, string(trimmer.bytes))
+		})
+	}
+}
+
+// walkASTRegisterTargets is a test helper to register simple targets and their build statements.
+func walkASTRegisterTargets(t *testing.T, stmts []*asp.Statement, pkg *core.Package) map[string]core.BuildLabel {
+	t.Helper()
+	targetLabels := map[string]core.BuildLabel{}
+	asp.WalkAST(stmts, func(stmt *asp.Statement) bool {
+		if arg := asp.FindArgument(stmt, "name"); arg != nil {
+			name := strings.Trim(arg.Value.Val.String, "\"")
+			label := core.NewBuildLabel(pkg.Name, name)
+			targetLabels[name] = label
+			target := &core.BuildTarget{Label: label}
+			pkg.Metadata.RegisterStatementTarget(target, func() core.BuildStatement {
+				return asp.NewBuildStatement(stmt)
+			})
+		}
+		return true
+	})
+	return targetLabels
 }
