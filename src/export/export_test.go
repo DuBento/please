@@ -2,6 +2,7 @@ package export
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -99,7 +100,7 @@ func TestFilterPackageFile(t *testing.T) {
 
 	pkg := core.NewPackage("test", core.WithPackageMetadata())
 	pkg.Filename = contentPath
-	targetLabels := walkASTRegisterTargets(t, statements, pkg)
+	targetLabels := walkASTRegisterTargets(t, statements, pkg, nil)
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -121,17 +122,20 @@ func TestFilterPackageFile(t *testing.T) {
 
 func TestTrimIf(t *testing.T) {
 	testCases := []struct {
-		name     string
-		content  string
-		required []string
-		expected string
+		name       string
+		content    string
+		registered []string
+		required   []string
+		expected   string
 	}{
 		{
 			name: "Keep target in if",
-			content: `if True:
-    genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
+			content: `
+if True:
+  genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
 `,
-			required: []string{"a"},
+			registered: []string{"a"},
+			required:   []string{"a"},
 			expected: `
 if True:
   genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
@@ -139,24 +143,37 @@ if True:
 		},
 		{
 			name: "Target not required - all statements trimmed",
-			content: `if True:
-    genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
+			content: `
+if True:
+  genrule(name = "a", cmd = "echo a > $OUT", outs = ["a"])
 `,
-			required: []string{},
-			expected: ``, // empty, all statements pruned
+			registered: []string{"a"},
+			required:   []string{},
+			// Empty, all statements pruned. Blank space removal is not performed by trimBlock's implementation so expect the new lines.
+			expected: `
+
+`,
 		},
 		{
 			name: "Required target in elif",
-			content: `if False:
+			content: `
+if False:
     genrule(name = "a")
 elif True:
     genrule(name = "b")
 else:
     genrule(name = "c")
 `,
-			required: []string{"b"},
-			expected: `genrule(name = "b")`,
-		},
+			registered: []string{"b"},
+			required:   []string{"b"},
+			expected: `
+if False:
+    pass  #Trimmed during export
+elif True:
+    genrule(name = "b")
+else:
+    pass  #Trimmed during export
+`},
 	}
 
 	for _, tc := range testCases {
@@ -168,7 +185,7 @@ else:
 			pkg := core.NewPackage("test", core.WithPackageMetadata())
 			pkg.Filename = "BUILD"
 
-			targetLabels := walkASTRegisterTargets(t, statements, pkg)
+			targetLabels := walkASTRegisterTargets(t, statements, pkg, tc.registered)
 			e := newExporter(nil, "", false).(*defaultExporter)
 			for _, name := range tc.required {
 				e.exportedTargets[targetLabels[name]] = true
@@ -187,19 +204,27 @@ else:
 }
 
 // walkASTRegisterTargets is a test helper to register simple targets and their build statements.
-func walkASTRegisterTargets(t *testing.T, stmts []*asp.Statement, pkg *core.Package) map[string]core.BuildLabel {
+func walkASTRegisterTargets(t *testing.T, stmts []*asp.Statement, pkg *core.Package, toRegister []string) map[string]core.BuildLabel {
 	t.Helper()
 	targetLabels := map[string]core.BuildLabel{}
 	asp.WalkAST(stmts, func(stmt *asp.Statement) bool {
-		if arg := asp.FindArgument(stmt, "name"); arg != nil {
-			name := strings.Trim(arg.Value.Val.String, "\"")
-			label := core.NewBuildLabel(pkg.Name, name)
-			targetLabels[name] = label
-			target := &core.BuildTarget{Label: label}
-			pkg.Metadata.RegisterStatementTarget(target, func() core.BuildStatement {
-				return asp.NewBuildStatement(stmt)
-			})
+		arg := asp.FindArgument(stmt, "name")
+		if arg == nil {
+			return true // Continue
 		}
+
+		// Not in targets we want to register, continue
+		name := strings.Trim(arg.Value.Val.String, "\"")
+		if toRegister != nil && !slices.Contains(toRegister, name) {
+			return true
+		}
+
+		label := core.NewBuildLabel(pkg.Name, name)
+		targetLabels[name] = label
+		target := &core.BuildTarget{Label: label}
+		pkg.Metadata.RegisterStatementTarget(target, func() core.BuildStatement {
+			return asp.NewBuildStatement(stmt)
+		})
 		return true
 	})
 	return targetLabels
