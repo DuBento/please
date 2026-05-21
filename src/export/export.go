@@ -247,7 +247,7 @@ func (e *defaultExporter) WritePackageFiles() {
 
 		parsedBuild, err := build.ParseBuild(pkg.Filename, filteredBytes)
 		if err != nil {
-			log.Fatalf("Failed to parse bytes for formatting: %v\n%s", err, filteredBytes)
+			log.Fatalf("Failed to parse bytes for formatting: %v\nData:\n%s", err, filteredBytes)
 		}
 		formattedBytes := build.Format(parsedBuild)
 

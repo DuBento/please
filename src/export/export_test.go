@@ -120,7 +120,7 @@ func TestFilterPackageFile(t *testing.T) {
 	}
 }
 
-func TestTrimIf(t *testing.T) {
+func TestStatementTrim(t *testing.T) {
 	testCases := []struct {
 		name       string
 		content    string
@@ -173,6 +173,42 @@ elif True:
     genrule(name = "b")
 else:
     pass  #Trimmed during export
+`},
+		{
+			name: "Required target in for",
+			content: `
+for i in range(0,2):
+    genrule(name = "a")
+`,
+			registered: []string{"a"},
+			required:   []string{"a"},
+			expected: `
+for i in range(0,2):
+    genrule(name = "a")
+`},
+		{
+			name: "Required if stmt in for",
+			content: `
+for i in [
+    "a",
+    "b",
+]:
+    if i == "a":
+        genrule(name = "a")
+    elif i == "b":
+        genrule(name = "b")
+`,
+			registered: []string{"a", "b"},
+			required:   []string{"a"},
+			expected: `
+for i in [
+    "a",
+    "b",
+]:
+    if i == "a":
+        genrule(name = "a")
+    elif i == "b":
+        pass  #Trimmed during export
 `},
 	}
 

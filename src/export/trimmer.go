@@ -102,7 +102,7 @@ func (t *trimmer) trimIf(stmt *asp.Statement) bool {
 	// writing the statement.
 	var requiredClauses = make([]bool, len(clauses))
 	for i, c := range clauses {
-		required := slices.ContainsFunc(c.stmts, t.isRequiredStatement)
+		required := t.isRequiredStatements(c.stmts)
 		requiredClauses[i] = required
 	}
 	// No clause is required, skip the if-else stmt entirely
@@ -128,9 +128,15 @@ func (t *trimmer) trimIf(stmt *asp.Statement) bool {
 	return true
 }
 
-func (t *trimmer) trimFor(stmt *asp.Statement) bool {
-	// TODO
-	return false
+func (t *trimmer) trimFor(stmt *asp.Statement) {
+	if len(stmt.For.Statements) == 0 || !t.isRequiredStatement(stmt) {
+		return
+	}
+
+	hStart, hEnd := stmt.Pos, stmt.For.Statements[0].Pos
+	t.copy(hStart, hEnd)
+
+	t.trimBlock(stmt.For.Statements, hEnd, stmt.EndPos)
 }
 
 func (t *trimmer) trimSubinclude(stmt *asp.Statement) {
@@ -155,7 +161,31 @@ func (t *trimmer) passBlock(stmts []*asp.Statement, blockStart, blockEnd asp.Pos
 
 }
 
+func (t *trimmer) isRequiredStatements(stmts []*asp.Statement) bool {
+	return slices.ContainsFunc(stmts, t.isRequiredStatement)
+}
+
 func (t *trimmer) isRequiredStatement(stmt *asp.Statement) bool {
+	if stmt.If != nil {
+		// If
+		if t.isRequiredStatements(stmt.If.Statements) {
+			return true
+		}
+		// Elif
+		if len(stmt.If.Elif) > 0 {
+			for _, elif := range stmt.If.Elif {
+				if t.isRequiredStatements(elif.Statements) {
+					return true
+				}
+			}
+		}
+		// Else
+		if len(stmt.If.ElseStatements) > 0 && t.isRequiredStatements(stmt.If.ElseStatements) {
+			return true
+		}
+	} else if stmt.For != nil {
+		return t.isRequiredStatements(stmt.For.Statements)
+	}
 	return t.anyExported(t.relatedTargets(stmt))
 }
 
