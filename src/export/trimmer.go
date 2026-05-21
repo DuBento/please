@@ -17,9 +17,6 @@ type trimmer struct {
 	pkg *core.Package
 	// bytes contain the content to be written after the trimming process.
 	bytes []byte
-	// indentLevel is the level of indentation for the current statements, i.e. how many
-	// blocks deep.
-	indentLevel int
 	// exporter is used to lookup target related data from the export process, e.g. which targets are
 	// required.
 	exporter *defaultExporter
@@ -122,13 +119,11 @@ func (t *trimmer) trimIf(stmt *asp.Statement) bool {
 		if i+1 < len(clauses) {
 			end = clauses[i+1].hStart
 		}
-		t.indentLevel++
 		if requiredClauses[i] {
 			t.trimBlock(c.stmts, c.hEnd, end)
 		} else {
 			t.passBlock(c.stmts, c.hEnd, end)
 		}
-		t.indentLevel--
 	}
 	return true
 }
