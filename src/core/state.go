@@ -922,6 +922,17 @@ func (state *BuildState) WaitForBuiltTarget(l, dependent BuildLabel, mode ParseM
 	return state.WaitForBuiltTarget(l, dependent, mode)
 }
 
+// RestartQueues recreates the task queues and resets the stop mechanism.
+func (state *BuildState) RestartQueues() {
+	state.progress.mutex.Lock()
+	defer state.progress.mutex.Unlock()
+
+	state.pendingParses = make(chan ParseTask, 10000)
+	state.pendingActions = make(chan Task, 1000)
+	state.progress.closeOnce = sync.Once{}
+	atomic.StoreInt64(&state.progress.numPending, 1) // Keep alive waiting for first task
+}
+
 // AddTarget adds a new target to the build graph.
 func (state *BuildState) AddTarget(pkg *Package, target *BuildTarget) {
 	pkg.AddTarget(target)

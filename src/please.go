@@ -1327,7 +1327,7 @@ type buildOpts struct {
 }
 
 // Runs the actual build
-// Which phases get run are controlled by shouldBuild and shouldTest.
+// Which phases get run are controlled by the build options.
 func runBuild(targets []core.BuildLabel, buildOpts buildOpts) (bool, *core.BuildState) {
 	if !buildOpts.IsQuery {
 		opts.BuildFlags.Exclude = append(opts.BuildFlags.Exclude, "manual", "manual:"+core.OsArch)

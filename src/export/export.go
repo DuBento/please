@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 
-	"github.com/please-build/buildtools/build"
+	plzfmt "github.com/please-build/buildtools/build"
 
+	"github.com/thought-machine/please/src/build"
 	"github.com/thought-machine/please/src/cli/logging"
 	"github.com/thought-machine/please/src/core"
 	"github.com/thought-machine/please/src/fs"
@@ -51,7 +53,7 @@ type Exporter interface {
 func Repo(state *core.BuildState, dir string, noTrim bool, targets []core.BuildLabel) {
 	e := newExporter(state, dir, noTrim)
 
-	// ensure output dir
+	// Ensure output dir
 	if err := os.MkdirAll(dir, fs.DirPermissions); err != nil {
 		log.Fatalf("failed to create export directory %s: %v", dir, err)
 	}
@@ -117,6 +119,8 @@ type baseExporter struct {
 	// impl is a reference to the concrete exporter implementation. It's included for calling the
 	// specific exporter implementation from the common methods.
 	impl Exporter
+	// workers group keep additional parser threads that are spawned only if required.
+	workers *sync.WaitGroup
 }
 
 func (be *baseExporter) ExportPlzConfig() {
@@ -137,13 +141,69 @@ func (be *baseExporter) ExportPlzConfig() {
 
 func (be *baseExporter) ExportTargets(labels core.BuildLabels) {
 	for _, l := range labels {
-		target := be.state.Graph.Target(l)
+		target := be.getOrParseTarget(l)
 		if target == nil {
 			log.Errorf("Unable to lookup target %s", l)
 			continue
 		}
 		be.impl.ExportTarget(target)
 	}
+}
+
+func (be *baseExporter) getOrParseTarget(label core.BuildLabel) *core.BuildTarget {
+	target := be.state.Graph.Target(label)
+	if target == nil {
+		if be.workers == nil {
+			be.startParserWorkers()
+		}
+		be.parseTarget(label)
+		target = be.state.Graph.Target(label)
+	}
+	return target
+}
+
+func (be *baseExporter) parseTarget(label core.BuildLabel) {
+	log.Warningf("Parsing %s", label)
+	be.state.Parses().Add(1)
+	parse.Parse(be.state, label, core.OriginalTarget, core.ParseModeNormal)
+	be.state.Parses().Add(-1)
+	be.state.TaskDone()
+	// target = be.state.Graph.Target(label)
+	// be.state.QueueTarget(label, core.OriginalTarget, false, core.ParseModeNormal)
+}
+
+func (be *baseExporter) startParserWorkers() {
+	be.state.RestartQueues()
+	parses, actions := be.state.TaskQueues()
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for task := range parses {
+			go func(t core.ParseTask) {
+				be.state.Parses().Add(1)
+				parse.Parse(be.state, t.Label, t.Dependent, t.Mode)
+				be.state.Parses().Add(-1)
+				be.state.TaskDone()
+			}(task)
+		}
+	})
+	wg.Go(func() {
+		for task := range actions {
+			go func(t core.Task) {
+				defer be.state.TaskDone()
+				switch task.Type {
+				case core.BuildTask:
+					build.Build(be.state, task.Target, false)
+				}
+			}(task)
+		}
+	})
+	be.workers = &wg
+}
+
+func (be *baseExporter) stopParserWorkers() {
+	be.state.Stop()
+	be.workers.Wait()
 }
 
 // exportDependencies exports exportDependencies of a target.
@@ -199,7 +259,7 @@ func (e *defaultExporter) ExportPreloaded() {
 		}
 	}
 
-	for _, target := range e.state.Config.Parse.PreloadSubincludes {
+	for _, target := range e.state.GetPreloadedSubincludes() {
 		targets := append(e.state.Graph.TransitiveSubincludes(target), target)
 		for _, t := range targets {
 			e.preloadedSubincludes[t] = true
@@ -245,11 +305,11 @@ func (e *defaultExporter) WritePackageFiles() {
 			continue
 		}
 
-		parsedBuild, err := build.ParseBuild(pkg.Filename, filteredBytes)
+		parsedBuild, err := plzfmt.ParseBuild(pkg.Filename, filteredBytes)
 		if err != nil {
 			log.Fatalf("Failed to parse bytes for formatting: %v\nData:\n%s", err, filteredBytes)
 		}
-		formattedBytes := build.Format(parsedBuild)
+		formattedBytes := plzfmt.Format(parsedBuild)
 
 		e.WriteExportedPackageFile(pkg, formattedBytes)
 	}
@@ -271,7 +331,7 @@ func (e *defaultExporter) exportSubincludes(pkg *core.Package, target *core.Buil
 		}
 		e.requiredSubincludes[pkg.Label()] = required
 
-		target := e.state.Graph.Target(subinclude)
+		target := e.getOrParseTarget(subinclude)
 		if target == nil {
 			log.Errorf("Unable to lookup target %s", subinclude)
 			continue
@@ -351,7 +411,7 @@ func (nte *noTrimExporter) ExportPreloaded() {
 		}
 	}
 
-	for _, target := range nte.state.Config.Parse.PreloadSubincludes {
+	for _, target := range nte.state.GetPreloadedSubincludes() {
 		targets := append(nte.state.Graph.TransitiveSubincludes(target), target)
 		nte.ExportTargets(targets)
 	}
@@ -403,9 +463,7 @@ func (nte *noTrimExporter) exportPackage(pkg *core.Package) {
 // exportSubincludes exports the subincluded targets.
 func (nte *noTrimExporter) exportSubincludes(pkg *core.Package) {
 	subincludes := pkg.AllSubincludes(nte.state.Graph)
-	for _, subinclude := range subincludes {
-		nte.ExportTarget(nte.state.Graph.TargetOrDie(subinclude))
-	}
+	nte.ExportTargets(subincludes)
 }
 
 // exportAllTargets will export all the targets in the provided package.
