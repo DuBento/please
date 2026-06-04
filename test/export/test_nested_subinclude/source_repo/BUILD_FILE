@@ -4,7 +4,7 @@ subinclude(
 )
 
 helper_rule_primary(
-    name = "my_target",
+    name = "target",
 )
 
 filegroup(

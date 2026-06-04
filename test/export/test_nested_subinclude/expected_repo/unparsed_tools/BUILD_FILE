@@ -1,5 +1,0 @@
-filegroup(
-    name = "nested-dep",
-    srcs = ["nested.sh"],
-    visibility = ["PUBLIC"],
-)

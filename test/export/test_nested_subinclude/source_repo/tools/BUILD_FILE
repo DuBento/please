@@ -1,6 +1,5 @@
 filegroup(
-    name = "helper-tool",
-    srcs = ["tool.build_defs"],
-    deps = ["//unparsed_tools:nested-dep"],
+    name = "tools",
+    srcs = ["tools.sh"],
     visibility = ["PUBLIC"],
 )
