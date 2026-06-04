@@ -1,0 +1,4 @@
+subinclude("//build_defs:secondary_build_def")
+
+def helper_rule_primary(name: str):
+    helper_rule(name)

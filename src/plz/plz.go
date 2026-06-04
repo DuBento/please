@@ -111,7 +111,17 @@ func Run(targets, preTargets []core.BuildLabel, state *core.BuildState, config *
 		wg.Done()
 	}()
 	// Wait until they've all exited, which they'll do once they have no tasks left.
+	if state.KeepParserRunning {
+		state.WaitForBuildToComplete()
+		CleanUp(state, config)
+		return
+	}
 	wg.Wait()
+	CleanUp(state, config)
+}
+
+// CleanUp cleans up and shuts down the build state.
+func CleanUp(state *core.BuildState, config *core.Configuration) {
 	if state.Cache != nil {
 		state.Cache.Shutdown()
 	}

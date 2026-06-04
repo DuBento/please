@@ -242,6 +242,8 @@ type BuildState struct {
 	NeedDebugDeps bool
 	// ParseMetadata is true if we want to store build file metadata
 	ParseMetadata bool
+	// KeepParserRunning prevents closing parsing channels to support later calls to parser.
+	KeepParserRunning bool
 
 	// initOnce is used to control loading the subrepo .plzconfig
 	initOnce *sync.Once
@@ -290,6 +292,7 @@ type stateProgress struct {
 	mutex      sync.Mutex
 	closeOnce  sync.Once
 	resultOnce sync.Once
+	buildOnce  sync.Once
 	// Used to track subinclude() calls that block until targets are built. Keyed by their label.
 	pendingTargets *cmap.Map[BuildLabel, chan struct{}]
 	// Used to track general package parsing requests. Keyed by a packageKey struct.
@@ -312,6 +315,10 @@ type stateProgress struct {
 	internalResults chan *BuildResult
 	// The cycle checker itself.
 	cycleDetector cycleDetector
+	// buildDone is closed when numPending drops to 0 or less
+	buildDone chan struct{}
+	// runDone is closed when runPlease or Please has finished
+	runDone chan struct{}
 }
 
 // SystemStats stores information about the system.
@@ -411,7 +418,13 @@ func (state *BuildState) taskDone(wasSynthetic bool) {
 		atomic.AddInt64(&state.progress.numDone, 1)
 	}
 	if atomic.AddInt64(&state.progress.numPending, -1) <= 0 {
-		state.Stop()
+		state.progress.buildOnce.Do(func() {
+			close(state.progress.buildDone)
+		})
+
+		if !state.KeepParserRunning {
+			state.Stop()
+		}
 	}
 }
 
@@ -920,6 +933,28 @@ func (state *BuildState) WaitForBuiltTarget(l, dependent BuildLabel, mode ParseM
 	// a potential race condition if the target was built between us checking earlier and registering
 	// the channel just now.
 	return state.WaitForBuiltTarget(l, dependent, mode)
+}
+
+// WaitForBuildToComplete blocks until all pending tasks are finished.
+func (state *BuildState) WaitForBuildToComplete() {
+	<-state.progress.buildDone
+}
+
+// KillAndExit stops the worker queues and blocks until the run has fully completed.
+func (state *BuildState) KillAndExit() {
+	state.Stop()
+	<-state.progress.runDone
+}
+
+// CloseRunDone marks the run as fully completed.
+func (state *BuildState) CloseRunDone() {
+	state.progress.mutex.Lock()
+	defer state.progress.mutex.Unlock()
+	select {
+	case <-state.progress.runDone:
+	default:
+		close(state.progress.runDone)
+	}
 }
 
 // AddTarget adds a new target to the build graph.
@@ -1488,6 +1523,8 @@ func NewBuildState(config *Configuration) *BuildState {
 			internalResults: make(chan *BuildResult, 1000),
 			cycleDetector:   cycleDetector{graph: graph},
 			originalTargets: NewTargetSet(),
+			buildDone:       make(chan struct{}),
+			runDone:         make(chan struct{}),
 		},
 		initOnce:            new(sync.Once),
 		preloadDownloadOnce: new(sync.Once),

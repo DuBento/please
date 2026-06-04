@@ -767,16 +767,22 @@ var buildFunctions = map[string]func() int{
 		return 0
 	},
 	"export": func() int {
-		success, state := runBuild(opts.Export.Args.Targets, buildOpts{ParseMetadata: true})
+		success, state := runBuild(opts.Export.Args.Targets, buildOpts{ParseMetadata: true, KeepParserRunning: true})
 		if success {
 			export.Repo(state, opts.Export.Output, opts.Export.NoTrim, state.ExpandOriginalLabels())
+		}
+		if state != nil {
+			state.KillAndExit()
 		}
 		return toExitCode(success, state)
 	},
 	"export.outputs": func() int {
-		success, state := runBuild(opts.Export.Outputs.Args.Targets, buildOpts{Build: true, IsQuery: true, ParseMetadata: true})
+		success, state := runBuild(opts.Export.Outputs.Args.Targets, buildOpts{Build: true, IsQuery: true, ParseMetadata: true, KeepParserRunning: true})
 		if success {
 			export.Outputs(state, opts.Export.Output, state.ExpandOriginalLabels())
+		}
+		if state != nil {
+			state.KillAndExit()
 		}
 		return toExitCode(success, state)
 	},
@@ -1166,6 +1172,7 @@ func Please(targets []core.BuildLabel, config *core.Configuration, buildOpts bui
 	state.NeedBuild = buildOpts.Build
 	state.NeedTests = buildOpts.Test
 	state.ParseMetadata = buildOpts.ParseMetadata
+	state.KeepParserRunning = buildOpts.KeepParserRunning
 	state.NeedDebugDeps = debug
 
 	// What outputs get downloaded in remote execution.
@@ -1226,7 +1233,15 @@ func runPlease(state *core.BuildState, targets []core.BuildLabel) {
 		wg.Done()
 	}()
 	plz.Run(targets, opts.BuildFlags.PreTargets, state, config, state.TargetArch)
-	wg.Wait()
+	if state.KeepParserRunning {
+		go func() {
+			wg.Wait()
+			state.CloseRunDone()
+		}()
+	} else {
+		wg.Wait()
+		state.CloseRunDone()
+	}
 }
 
 // testTargets handles test targets which can be given in two formats; a list of targets or a single
@@ -1320,10 +1335,11 @@ func readConfig() *core.Configuration {
 
 // buildOpts specifies parameter for the core.runBuild method.
 type buildOpts struct {
-	Build         bool
-	Test          bool
-	IsQuery       bool
-	ParseMetadata bool
+	Build             bool
+	Test              bool
+	IsQuery           bool
+	ParseMetadata     bool
+	KeepParserRunning bool
 }
 
 // Runs the actual build
