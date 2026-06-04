@@ -768,21 +768,20 @@ var buildFunctions = map[string]func() int{
 	},
 	"export": func() int {
 		success, state := runBuild(opts.Export.Args.Targets, buildOpts{ParseMetadata: true, KeepParserRunning: true})
+		if opts.Run.Remote {
+			defer state.RemoteClient.Disconnect()
+		}
+
 		if success {
 			export.Repo(state, opts.Export.Output, opts.Export.NoTrim, state.ExpandOriginalLabels())
 		}
-		if state != nil {
-			state.KillAndExit()
-		}
+
 		return toExitCode(success, state)
 	},
 	"export.outputs": func() int {
-		success, state := runBuild(opts.Export.Outputs.Args.Targets, buildOpts{Build: true, IsQuery: true, ParseMetadata: true, KeepParserRunning: true})
+		success, state := runBuild(opts.Export.Outputs.Args.Targets, buildOpts{Build: true, IsQuery: true})
 		if success {
 			export.Outputs(state, opts.Export.Output, state.ExpandOriginalLabels())
-		}
-		if state != nil {
-			state.KillAndExit()
 		}
 		return toExitCode(success, state)
 	},
@@ -1197,7 +1196,7 @@ func Please(targets []core.BuildLabel, config *core.Configuration, buildOpts bui
 	}
 
 	runPlease(state, targets)
-	if state.RemoteClient != nil && !opts.Run.Remote {
+	if state.RemoteClient != nil && !opts.Run.Remote && !state.KeepParserRunning {
 		defer state.RemoteClient.Disconnect()
 	}
 	failures, _, _ := state.Failures()
@@ -1233,15 +1232,7 @@ func runPlease(state *core.BuildState, targets []core.BuildLabel) {
 		wg.Done()
 	}()
 	plz.Run(targets, opts.BuildFlags.PreTargets, state, config, state.TargetArch)
-	if state.KeepParserRunning {
-		go func() {
-			wg.Wait()
-			state.CloseRunDone()
-		}()
-	} else {
-		wg.Wait()
-		state.CloseRunDone()
-	}
+	wg.Wait()
 }
 
 // testTargets handles test targets which can be given in two formats; a list of targets or a single
