@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
 
 	"github.com/please-build/buildtools/build"
 
@@ -150,16 +149,7 @@ func (be *baseExporter) ExportTargets(labels core.BuildLabels) {
 func (be *baseExporter) getOrParseTarget(label core.BuildLabel) *core.BuildTarget {
 	target := be.state.Graph.Target(label)
 	if target == nil {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			be.state.Parses().Add(1)
-			parse.Parse(be.state, label, core.OriginalTarget, core.ParseModeNormal)
-			be.state.Parses().Add(-1)
-			be.state.TaskDone()
-			wg.Done()
-		}()
-		wg.Wait()
+		be.state.WaitForBuiltTarget(label, core.OriginalTarget, core.ParseModeNormal)
 		target = be.state.Graph.Target(label)
 	}
 	return target
