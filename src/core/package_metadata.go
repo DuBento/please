@@ -60,6 +60,8 @@ type PackageMetadata interface {
 	// FindRequiredSubincludes returns all subinclude labels that were required by the given target.
 	// The return value is empty if no subinclude information was found for the target.
 	FindRequiredSubincludes(target *BuildTarget) BuildLabels
+	// TODO
+	FindRelatedTargets(target *BuildTarget) BuildLabels
 	// GetSubincludedLabels returns all build labels that were included by the given subinclude statement.
 	// Returns the labels or an empty slice if the statement wasn't found.
 	GetSubincludedLabels(stmt *BuildStatement) BuildLabels
@@ -144,6 +146,23 @@ func (m *packageMetadataImpl) FindRequiredSubincludes(target *BuildTarget) Build
 	return m.TargetToSubinclude[target]
 }
 
+func (m *packageMetadataImpl) FindRelatedTargets(target *BuildTarget) BuildLabels {
+	stmt := m.FindStatement(target)
+	if stmt == nil {
+		log.Errorf("Failed to find statement for target %s", target)
+		return nil
+	}
+
+	relatedTargets := m.FindTargets(stmt)
+	labels := make(BuildLabels, 0, len(relatedTargets))
+	for _, t := range relatedTargets {
+		if t.Label != target.Label {
+			labels = append(labels, t.Label)
+		}
+	}
+	return labels
+}
+
 func (m *packageMetadataImpl) GetSubincludedLabels(stmt *BuildStatement) BuildLabels {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
@@ -175,6 +194,9 @@ func (n *noopPackageMetadata) FindTargets(stmt *BuildStatement) []*BuildTarget {
 }
 func (n *noopPackageMetadata) FindRequiredSubincludes(target *BuildTarget) BuildLabels {
 	log.Fatalf("Metadata not tracked, using no-op implementation.")
+	return nil
+}
+func (m *noopPackageMetadata) FindRelatedTargets(target *BuildTarget) BuildLabels {
 	return nil
 }
 func (n *noopPackageMetadata) GetSubincludedLabels(stmt *BuildStatement) BuildLabels {

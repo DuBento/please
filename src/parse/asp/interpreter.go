@@ -26,6 +26,7 @@ type interpreter struct {
 	parser      *Parser
 	subincludes *cmap.ErrMap[string, pyDict]
 	asts        *cmap.ErrMap[string, []*Statement]
+	preloaded   *cmap.Map[string, struct{}]
 
 	configs      map[*core.BuildState]*pyConfig
 	configsMutex sync.RWMutex
@@ -54,6 +55,7 @@ func newInterpreter(state *core.BuildState, p *Parser) *interpreter {
 	i := &interpreter{
 		scope:      s,
 		parser:     p,
+		preloaded:  cmap.New[string, struct{}](cmap.SmallShardCount, cmap.XXHash),
 		configs:    map[*core.BuildState]*pyConfig{},
 		limiter:    make(semaphore, state.Config.Parse.NumThreads),
 		regexCache: cmap.New[string, *regexp.Regexp](cmap.SmallShardCount, cmap.XXHash),
@@ -162,9 +164,21 @@ func (i *interpreter) preloadSubinclude(s *scope, label core.BuildLabel) (err er
 
 	s.interpreter.loadPluginConfig(s, includeState)
 	for _, out := range t.FullOutputs() {
-		s.SetAllWithOrigin(s.interpreter.Subinclude(s, out, t.Label, true), false, &t.Label)
+		globals := s.interpreter.Subinclude(s, out, t.Label, true)
+		i.registerPreloaded(globals)
+		s.SetAllWithOrigin(globals, false, &t.Label)
 	}
 	return nil
+}
+
+// registerPreloaded marks objects as preloaded for later reference.
+func (i *interpreter) registerPreloaded(d pyDict) {
+	for k := range d {
+		if k == "CONFIG" {
+			continue
+		}
+		i.preloaded.Add(k, struct{}{})
+	}
 }
 
 // interpretAll runs a series of statements in the scope of the given package.
@@ -223,6 +237,7 @@ func (i *interpreter) interpretStatements(s *scope, statements []*Statement) (re
 
 // Subinclude returns the global values corresponding to subincluding the given file.
 func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildLabel, preload bool) pyDict {
+	log.Warningf("Subinclude %s", label)
 	key := filepath.Join(path, pkgScope.state.CurrentSubrepo)
 	globals, err := i.subincludes.GetOrSet(key, func() (pyDict, error) {
 		pprof.SetGoroutineLabels(pprof.WithLabels(pkgScope.ctx, pprof.Labels("subinclude", path)))
@@ -254,9 +269,11 @@ func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildL
 		if s.config.overlay == nil {
 			delete(locals, "CONFIG") // Config doesn't have any local modifications
 		}
+		log.Debugf("Locals for %s: %s", key, locals)
 		return locals, nil
 	})
 	pkgScope.Assert(err == nil, "failed to subinclude %s: %s", label, err)
+	log.Debugf("Values from %s: %s", label, globals)
 	return globals
 }
 
@@ -472,13 +489,16 @@ func (s *scope) NAssert(condition bool, msg string, args ...interface{}) {
 func (s *scope) Lookup(name string) pyObject {
 	obj, origin := s.lookupWithOrigin(name)
 	s.metadata.SetRequiredOrigin(origin)
+	log.Debugf("Lookup %s with origin %s", name, origin)
 	return obj
 }
 
 // lookupWithOrigin is like Lookup but returns the origin label of the variable as well.
 func (s *scope) lookupWithOrigin(name string) (pyObject, *core.BuildLabel) {
 	if obj, present := s.locals[name]; present {
-		return obj, s.metadata.Origin(name)
+		return obj, s.metadata.Origin(s, name)
+		// } else if s.interpreter.preloaded.Contains(name) {
+		// 	return s.interpreter.scope.LocalLookup(name), nil
 	} else if s.parent != nil {
 		return s.parent.lookupWithOrigin(name)
 	}
@@ -504,7 +524,7 @@ func (s *scope) SetAll(d pyDict, publicOnly bool) {
 	s.SetAllWithOrigin(d, publicOnly, nil)
 }
 
-// SetAllWithOrigin is like SetAll but also records the origin labe	l for all variables.
+// SetAllWithOrigin is like SetAll but also records the origin label for all variables.
 func (s *scope) SetAllWithOrigin(d pyDict, publicOnly bool, origin *core.BuildLabel) {
 	for k, v := range d {
 		if k == "CONFIG" {
@@ -512,6 +532,9 @@ func (s *scope) SetAllWithOrigin(d pyDict, publicOnly bool, origin *core.BuildLa
 			c, ok := v.(*pyFrozenConfig)
 			s.Assert(ok, "incoming CONFIG isn't a config object")
 			s.config.Merge(c)
+			// } else if s.interpreter.preloaded.Contains(k) {
+			// 	// skip if preloaded
+			// 	continue
 		} else if !publicOnly || k[0] != '_' {
 			s.locals[k] = v
 			if origin != nil {
@@ -1159,7 +1182,7 @@ type ScopeMetadata interface {
 	// Cursor returns the statement being currently interpreted.
 	Cursor() *Statement
 	// Origin gets the origin of the object by name. Should return nil if not found or unimplemented.
-	Origin(name string) *core.BuildLabel
+	Origin(scope *scope, name string) *core.BuildLabel
 	// RequiredOrigins returns a set of all the origins (subincluded labels) required by the current
 	// scope.
 	RequiredOrigins() map[core.BuildLabel]struct{}
@@ -1193,7 +1216,10 @@ func (m *scopeMetadata) Cursor() *Statement {
 	return m.cursor
 }
 
-func (m *scopeMetadata) Origin(name string) *core.BuildLabel {
+func (m *scopeMetadata) Origin(scope *scope, name string) *core.BuildLabel {
+	if scope.interpreter.preloaded.Contains(name) {
+		return nil
+	}
 	if label, ok := m.objectOrigins[name]; ok {
 		return &label
 	}
@@ -1209,6 +1235,7 @@ func (m *scopeMetadata) SetCursor(stmt *Statement) {
 }
 
 func (m *scopeMetadata) SetObjectOrigin(name string, origin core.BuildLabel) {
+	log.Debugf("Set %s with origin %s", name, origin)
 	m.objectOrigins[name] = origin
 }
 
@@ -1225,7 +1252,7 @@ type noopScopeMetadata struct{}
 
 func (nm *noopScopeMetadata) NewMetadata() ScopeMetadata                          { return &noopScopeMetadata{} }
 func (nm *noopScopeMetadata) Cursor() *Statement                                  { return nil }
-func (nm *noopScopeMetadata) Origin(name string) *core.BuildLabel                 { return nil }
+func (nm *noopScopeMetadata) Origin(scope *scope, name string) *core.BuildLabel   { return nil }
 func (nm *noopScopeMetadata) RequiredOrigins() map[core.BuildLabel]struct{}       { return nil }
 func (nm *noopScopeMetadata) SetCursor(stmt *Statement)                           {}
 func (nm *noopScopeMetadata) SetObjectOrigin(name string, origin core.BuildLabel) {}
