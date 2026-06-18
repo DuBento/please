@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"iter"
 	"maps"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime/debug"
@@ -22,11 +21,12 @@ import (
 
 // An interpreter holds the package-independent state about our parsing process.
 type interpreter struct {
-	scope       *scope
-	parser      *Parser
-	subincludes *cmap.ErrMap[string, pyDict]
+	scope  *scope
+	parser *Parser
+	// subincludes caches the symbols for each subincluded target to avoid multiple interpreter runs.
+	subincludes *cmap.ErrMap[core.BuildLabel, pyDict]
 	asts        *cmap.ErrMap[string, []*Statement]
-	// preloaded is a set to register all preloaded objects.
+	// preloaded is a set to register all preloaded symbols.
 	preloaded *cmap.Map[string, struct{}]
 
 	configs      map[*core.BuildState]*pyConfig
@@ -56,7 +56,6 @@ func newInterpreter(state *core.BuildState, p *Parser) *interpreter {
 	i := &interpreter{
 		scope:      s,
 		parser:     p,
-		preloaded:  cmap.New[string, struct{}](cmap.SmallShardCount, cmap.XXHash),
 		configs:    map[*core.BuildState]*pyConfig{},
 		limiter:    make(semaphore, state.Config.Parse.NumThreads),
 		regexCache: cmap.New[string, *regexp.Regexp](cmap.SmallShardCount, cmap.XXHash),
@@ -65,9 +64,11 @@ func newInterpreter(state *core.BuildState, p *Parser) *interpreter {
 	if p.interpreter != nil {
 		i.subincludes = p.interpreter.subincludes
 		i.asts = p.interpreter.asts
+		i.preloaded = p.interpreter.preloaded
 	} else {
-		i.subincludes = cmap.NewErrMap[string, pyDict](cmap.SmallShardCount, cmap.XXHash, i.limiter)
+		i.subincludes = cmap.NewErrMap[core.BuildLabel, pyDict](cmap.SmallShardCount, core.HashBuildLabel, i.limiter)
 		i.asts = cmap.NewErrMap[string, []*Statement](cmap.SmallShardCount, cmap.XXHash, i.limiter)
+		i.preloaded = cmap.New[string, struct{}](cmap.SmallShardCount, cmap.XXHash)
 	}
 	s.interpreter = i
 	s.LoadSingletons(state)
@@ -165,9 +166,8 @@ func (i *interpreter) preloadSubinclude(s *scope, label core.BuildLabel) (err er
 
 	s.interpreter.loadPluginConfig(s, includeState)
 	for _, out := range t.FullOutputs() {
-		globals := s.interpreter.Subinclude(s, out, t.Label, true)
-		s.interpreter.registerPreloaded(globals)
-		s.SetAllWithOrigin(globals, false, &t.Label)
+		s.interpreter.Subinclude(s, out, t.Label, true)
+		// s.interpreter.registerPreloaded(globals)
 	}
 	return nil
 }
@@ -239,9 +239,8 @@ func (i *interpreter) interpretStatements(s *scope, statements []*Statement) (re
 }
 
 // Subinclude returns the global values corresponding to subincluding the given file.
-func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildLabel, preload bool) pyDict {
-	key := filepath.Join(path, pkgScope.state.CurrentSubrepo)
-	globals, err := i.subincludes.GetOrSet(key, func() (pyDict, error) {
+func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildLabel, preload bool) {
+	_, err := i.subincludes.GetOrSet(label, func() (pyDict, error) {
 		pprof.SetGoroutineLabels(pprof.WithLabels(pkgScope.ctx, pprof.Labels("subinclude", path)))
 		defer pprof.SetGoroutineLabels(pkgScope.ctx)
 		stmts, err := i.parseSubinclude(path)
@@ -271,10 +270,11 @@ func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildL
 		if s.config.overlay == nil {
 			delete(locals, "CONFIG") // Config doesn't have any local modifications
 		}
+
 		return locals, nil
 	})
 	pkgScope.Assert(err == nil, "failed to subinclude %s: %s", label, err)
-	return globals
+	pkgScope.Subinclude(&label)
 }
 
 // parseSubinclude parses a subinclude to an AST, caching it (globally)
@@ -332,14 +332,21 @@ type scope struct {
 	parent *scope
 	// caller points to the scope that initiated the call which created this scope.
 	// It is used to trace the call stack and is nil if not in a call stack.
-	caller  *scope
-	locals  pyDict
-	config  *pyConfig
-	globber *fs.Globber
+	caller      *scope
+	symbols     symbolStore
+	subincluded []*core.BuildLabel
+	locals      pyDict
+	config      *pyConfig
+	globber     *fs.Globber
 	// True if this scope is for a pre- or post-build callback.
 	Callback bool
 	mode     core.ParseMode
 	metadata scopeMetadata
+}
+
+type symbolStore struct {
+	locals      pyDict
+	subincluded core.BuildLabels
 }
 
 // parseAnnotatedLabelInPackage similarly to parseLabelInPackage, parses the label contextualising it to the provided
@@ -499,20 +506,43 @@ func (s *scope) Lookup(name string) pyObject {
 }
 
 // lookup implements the recursive lookup over parent scopes.
-func (s *scope) lookupWithOrigin(name string) (pyObject, *core.BuildLabel) {
-	if obj, present := s.locals[name]; present {
-		return obj, s.metadata.origin(s, name)
-	} else if s.parent != nil {
-		return s.parent.lookupWithOrigin(name)
+func (s *scope) lookupWithOrigin(name string) (object pyObject, origin *core.BuildLabel) {
+	if object = s.localLookup(name); object != nil {
+		return object, nil
+	} else if object, origin = s.subincludedLookup(name); object != nil {
+		return object, origin
 	}
 	return s.Error("name '%s' is not defined", name), nil
 }
 
-// LocalLookup looks up a variable name in the current scope.
+func (s *scope) localLookup(name string) pyObject {
+	if obj, present := s.locals[name]; present {
+		return obj
+	}
+	if s.parent != nil {
+		return s.parent.localLookup(name)
+	}
+	return nil
+}
+
+func (s *scope) subincludedLookup(name string) (object pyObject, origin *core.BuildLabel) {
+	// Reverse, prioritise later additions to allow redefinition.
+	for i := len(s.subincluded) - 1; i >= 0; i-- {
+		label := s.subincluded[i]
+		symbols, err := s.interpreter.subincludes.Get(*label)
+		s.Assert(err == nil, "failed to lookup symbol %s in subinclude %s: %s", name, label, err)
+		if obj, present := symbols[name]; present {
+			return obj, label
+		}
+	}
+	return nil, nil
+}
+
+// LocalScopeLookup looks up a variable name in the current scope.
 // It does *not* walk back up parent scopes and instead returns nil if the variable could not be found.
 // This is typically used for things like function arguments where we're only interested in variables
 // in immediate scope.
-func (s *scope) LocalLookup(name string) pyObject {
+func (s *scope) LocalScopeLookup(name string) pyObject {
 	return s.locals[name]
 }
 
@@ -524,11 +554,6 @@ func (s *scope) Set(name string, value pyObject) {
 // SetAll sets all contents of the given dict in this scope.
 // Optionally it can filter to just public objects (i.e. those not prefixed with an underscore)
 func (s *scope) SetAll(d pyDict, publicOnly bool) {
-	s.SetAllWithOrigin(d, publicOnly, nil)
-}
-
-// SetAllWithOrigin is like SetAll but also records the origin label for all variables.
-func (s *scope) SetAllWithOrigin(d pyDict, publicOnly bool, origin *core.BuildLabel) {
 	for k, v := range d {
 		if k == "CONFIG" {
 			// Special case; need to merge config entries rather than overwriting the entire object.
@@ -537,11 +562,12 @@ func (s *scope) SetAllWithOrigin(d pyDict, publicOnly bool, origin *core.BuildLa
 			s.config.Merge(c)
 		} else if !publicOnly || k[0] != '_' {
 			s.locals[k] = v
-			if origin != nil {
-				s.metadata.setSymbolOrigin(k, *origin)
-			}
 		}
 	}
+}
+
+func (s *scope) Subinclude(label *core.BuildLabel) {
+	s.subincluded = append(s.subincluded, label)
 }
 
 // Freeze freezes the contents of this scope, preventing mutable objects from being changed.
@@ -1277,6 +1303,7 @@ func (m *trackingScopeMetadata) setCursor(stmt *Statement) {
 
 // setSymbolOrigin implements [scopeMetadata].
 func (m *trackingScopeMetadata) setSymbolOrigin(name string, origin core.BuildLabel) {
+	fmt.Printf("  - setting %s with origin %s\n", name, origin)
 	m.symbolOrigins[name] = origin
 }
 

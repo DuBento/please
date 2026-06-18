@@ -465,16 +465,17 @@ func (label BuildLabel) SubrepoLabel(state *BuildState) BuildLabel {
 	return t
 }
 
+// HashBuildLabel calculates an hash of Build Label, suitable to use for map indexing.
+func HashBuildLabel(l BuildLabel) uint64 {
+	return cmap.XXHashes(l.Subrepo, l.PackageName, l.Name)
+}
+
 func subrepoLabel(subrepoName, arch string) BuildLabel {
 	if idx := strings.LastIndexByte(subrepoName, '/'); idx != -1 {
 		return BuildLabel{PackageName: subrepoName[:idx], Name: subrepoName[idx+1:], Subrepo: arch}
 	}
 	// This is legit, the subrepo is defined at the root.
 	return BuildLabel{Name: subrepoName, Subrepo: arch}
-}
-
-func hashBuildLabel(l BuildLabel) uint64 {
-	return cmap.XXHashes(l.Subrepo, l.PackageName, l.Name)
 }
 
 // packageKey returns a key for this build label that only uses the subrepo and package parts.

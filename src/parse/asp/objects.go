@@ -734,7 +734,7 @@ func (f *pyFunc) Call(s *scope, c *Call) pyObject {
 	}
 	// Now make sure any arguments with defaults are set, and check any others have been passed.
 	for i, a := range f.args {
-		if callScope.LocalLookup(a) == nil {
+		if callScope.LocalScopeLookup(a) == nil {
 			callScope.Set(a, f.defaultArg(s, i, a))
 		}
 	}

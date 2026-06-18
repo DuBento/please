@@ -310,7 +310,8 @@ func bazelLoad(s *scope, args []pyObject) pyObject {
 		}
 		filename = subrepo.Dir(filename)
 	}
-	s.SetAllWithOrigin(s.interpreter.Subinclude(s, filename, l, false), false, &l)
+	s.interpreter.Subinclude(s, filename, l, false)
+	s.Subinclude(&l)
 	return None
 }
 
@@ -369,7 +370,8 @@ func subinclude(s *scope, args []pyObject) pyObject {
 			outs = t.Outputs()
 		}
 		for _, out := range outs {
-			s.SetAllWithOrigin(s.interpreter.Subinclude(s, filepath.Join(t.OutDir(), out), t.Label, false), false, &t.Label)
+			s.interpreter.Subinclude(s, filepath.Join(t.OutDir(), out), t.Label, false)
+			s.Subinclude(&t.Label)
 		}
 	}
 	return None
