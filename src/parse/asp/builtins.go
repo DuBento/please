@@ -248,7 +248,7 @@ func filegroup(s *scope, args []pyObject) pyObject {
 // pkg implements the package() builtin function.
 func pkg(s *scope, args []pyObject) pyObject {
 	s.Assert(s.pkg.NumTargets() == 0, "package() must be called before any build targets are defined")
-	for k, v := range s.locals {
+	for k, v := range s.symbols.locals {
 		k = strings.ToUpper(k)
 		configVal := s.config.Get(k, nil)
 		s.Assert(configVal != nil, "error calling package(): %s is not a known config value", k)
@@ -659,7 +659,7 @@ func strFormat(s *scope, args []pyObject) pyObject {
 			s.Assert(arg < len(args), "format string specifies at least %d positional arguments, but only %d were supplied", arg, len(args)-1)
 			buf.WriteString(args[arg].String())
 			arg++
-		} else if val, present := s.locals[key]; present {
+		} else if val := s.OptionalLookup(key); val != nil {
 			buf.WriteString(val.String())
 		} else {
 			// We may want to error here in some future revision
