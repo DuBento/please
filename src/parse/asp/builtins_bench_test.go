@@ -6,9 +6,11 @@ import (
 
 func BenchmarkStrFormat(b *testing.B) {
 	s := &scope{
-		locals: map[string]pyObject{
-			"spam": pyString("abc"),
-			"eggs": pyString("def"),
+		symbols: symbolStore{
+			locals: map[string]pyObject{
+				"spam": pyString("abc"),
+				"eggs": pyString("def"),
+			},
 		},
 	}
 	args := []pyObject{
@@ -25,16 +27,18 @@ func BenchmarkStrFormatBig(b *testing.B) {
 	// Similar to above, but with a much bigger format string
 	// If you think this looks degenerate, you'd be right...
 	s := &scope{
-		locals: map[string]pyObject{
-			"commands":                   pyString(tfCmds),
-			"tarball_target":             pyString(":please_tf_library_tarball"),
-			"var_file_paths_csv":         pyString(""),
-			"var_file_paths_csv_sandbox": pyString(""),
-			"data_paths_csv":             pyString(""),
-			"data_paths_csv_sandbox":     pyString(""),
-			"pkg_name":                   pyString("corp/please/website"),
-			"plugins_extract_script":     pyString(""),
-			"terraform_cli":              pyString("//third_party/binary:terraform_1-5"),
+		symbols: symbolStore{
+			locals: map[string]pyObject{
+				"commands":                   pyString(tfCmds),
+				"tarball_target":             pyString(":please_tf_library_tarball"),
+				"var_file_paths_csv":         pyString(""),
+				"var_file_paths_csv_sandbox": pyString(""),
+				"data_paths_csv":             pyString(""),
+				"data_paths_csv_sandbox":     pyString(""),
+				"pkg_name":                   pyString("corp/please/website"),
+				"plugins_extract_script":     pyString(""),
+				"terraform_cli":              pyString("//third_party/binary:terraform_1-5"),
+			},
 		},
 	}
 	args := []pyObject{pyString(tfCmd)}

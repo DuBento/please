@@ -70,9 +70,11 @@ func TestTag(t *testing.T) {
 
 func TestStrFormat(t *testing.T) {
 	s := &scope{
-		locals: map[string]pyObject{
-			"spam": pyString("abc"),
-			"eggs": pyString("def"),
+		symbols: symbolStore{
+			locals: map[string]pyObject{
+				"spam": pyString("abc"),
+				"eggs": pyString("def"),
+			},
 		},
 	}
 
@@ -83,10 +85,12 @@ func TestStrFormat(t *testing.T) {
 
 func TestStrFormat2(t *testing.T) {
 	s := &scope{
-		locals: map[string]pyObject{
-			"owner":    pyString("please-build"),
-			"plugin":   pyString("java-rules"),
-			"revision": pyString("v0.3.0"),
+		symbols: symbolStore{
+			locals: map[string]pyObject{
+				"owner":    pyString("please-build"),
+				"plugin":   pyString("java-rules"),
+				"revision": pyString("v0.3.0"),
+			},
 		},
 	}
 
@@ -97,10 +101,12 @@ func TestStrFormat2(t *testing.T) {
 
 func TestStrFormat3(t *testing.T) {
 	s := &scope{
-		locals: map[string]pyObject{
-			"url_base":     pyString("https://please.build/py-wheels"),
-			"package_name": pyString("coverage"),
-			"version":      pyString("5.5"),
+		symbols: symbolStore{
+			locals: map[string]pyObject{
+				"url_base":     pyString("https://please.build/py-wheels"),
+				"package_name": pyString("coverage"),
+				"version":      pyString("5.5"),
+			},
 		},
 	}
 
@@ -111,7 +117,9 @@ func TestStrFormat3(t *testing.T) {
 
 func TestStrFormat4(t *testing.T) {
 	s := &scope{
-		locals: map[string]pyObject{},
+		symbols: symbolStore{
+			locals: map[string]pyObject{},
+		},
 	}
 
 	assert.EqualValues(t, `echo "tools/images/please_ubuntu@$please_ubuntu_digest" > $OUT`, strFormat(s, []pyObject{

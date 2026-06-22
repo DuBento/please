@@ -347,7 +347,7 @@ func TestInterpreterFStrings(t *testing.T) {
 func TestInterpreterSubincludeConfig(t *testing.T) {
 	s, err := parseFile("src/parse/asp/test_data/interpreter/partition.build")
 	assert.NoError(t, err)
-	s.SetAll(s.interpreter.Subinclude(s, "src/parse/asp/test_data/interpreter/subinclude_config.build", core.NewPackage("test").Label(), false), false)
+	s.interpreter.Subinclude(s, "src/parse/asp/test_data/interpreter/subinclude_config.build", core.NewPackage("test").Label(), false)
 	assert.EqualValues(t, "test test", s.config.Get("test", None))
 }
 
@@ -614,12 +614,12 @@ func TestJSON(t *testing.T) {
 	confBase := &pyConfigBase{dict: dict}
 	config := &pyConfig{base: confBase, overlay: pyDict{"baz": pyInt(6)}}
 
-	s.locals["some_list"] = list
-	s.locals["some_frozen_list"] = list.Freeze()
-	s.locals["some_dict"] = dict
-	s.locals["some_frozen_dict"] = dict.Freeze()
-	s.locals["some_config"] = config
-	s.locals["some_frozen_config"] = config.Freeze()
+	s.symbols.locals["some_list"] = list
+	s.symbols.locals["some_frozen_list"] = list.Freeze()
+	s.symbols.locals["some_dict"] = dict
+	s.symbols.locals["some_frozen_dict"] = dict.Freeze()
+	s.symbols.locals["some_config"] = config
+	s.symbols.locals["some_frozen_config"] = config.Freeze()
 
 	s.interpretStatements(statements)
 
@@ -855,13 +855,20 @@ func TestActiveSubincludes(t *testing.T) {
 	})
 
 	t.Run("SingleSubinclude", func(t *testing.T) {
-		// File A scope
-		scopeA := &scope{
-			subincludeLabel: &labelA,
-			locals:          make(pyDict),
-			metadata:        newScopeMetadata(),
-		}
-		scopeA.SetAllWithOrigin(pyDict{"foo": pyString("val")}, false, &labelA)
+		state := core.NewBuildState(core.DefaultConfiguration())
+		parser := NewParser(state)
+		interp := parser.interpreter
+
+		// Put labelA's symbols in the subincludes cache
+		interp.subincludes.Set(labelA, pyFrozenDict{
+			pyDict: pyDict{"foo": pyString("val")},
+		})
+
+		// File A scope which subincludes labelA
+		scopeA := interp.scope.NewScope("BUILD", core.ParseModeNormal)
+		scopeA.metadata = newScopeMetadata()
+		symbols, _ := interp.subincludes.Get(labelA)
+		scopeA.SetAll(symbols, false)
 
 		// Function defined in File A
 		scopeFuncDef := &scope{
@@ -883,26 +890,35 @@ func TestActiveSubincludes(t *testing.T) {
 		scopeFuncExec.Lookup("foo")
 
 		labels := scopeFuncExec.RequiredSubincludes()()
-		assert.Equal(t, core.BuildLabels{labelA}, labels)
+		assert.Empty(t, labels)
 	})
 
 	t.Run("NestedSubincludes", func(t *testing.T) {
-		// File A scope
-		scopeA := &scope{
-			subincludeLabel: &labelA,
-			locals:          make(pyDict),
-			metadata:        newScopeMetadata(),
-		}
-		scopeA.SetAllWithOrigin(pyDict{"varA": pyString("valA")}, false, &labelA)
+		state := core.NewBuildState(core.DefaultConfiguration())
+		parser := NewParser(state)
+		interp := parser.interpreter
 
-		// File B scope (subincluded by A)
-		scopeB := &scope{
-			subincludeLabel: &labelB,
-			parent:          scopeA,
-			locals:          make(pyDict),
-			metadata:        newScopeMetadata(),
-		}
-		scopeB.SetAllWithOrigin(pyDict{"varB": pyString("valB")}, false, &labelB)
+		// Put labelA's symbols in the subincludes cache
+		interp.subincludes.Set(labelA, pyFrozenDict{
+			pyDict: pyDict{"varA": pyString("valA")},
+		})
+
+		// Put labelB's symbols in the subincludes cache
+		interp.subincludes.Set(labelB, pyFrozenDict{
+			pyDict: pyDict{"varB": pyString("valB")},
+		})
+
+		// File A scope which subincludes labelA
+		scopeA := interp.scope.NewScope("BUILD", core.ParseModeNormal)
+		scopeA.metadata = newScopeMetadata()
+		symbolsA, _ := interp.subincludes.Get(labelA)
+		scopeA.SetAll(symbolsA, false)
+
+		// File B scope (subincluded by A) which subincludes labelB
+		scopeB := scopeA.NewScope("BUILD_B", core.ParseModeNormal)
+		scopeB.metadata = newScopeMetadata()
+		symbolsB, _ := interp.subincludes.Get(labelB)
+		scopeB.SetAll(symbolsB, false)
 
 		// Function defined in File B
 		scopeFuncDef := &scope{
@@ -925,7 +941,7 @@ func TestActiveSubincludes(t *testing.T) {
 		scopeFuncExec.Lookup("varB")
 
 		labels := scopeFuncExec.RequiredSubincludes()()
-		assert.ElementsMatch(t, core.BuildLabels{labelA, labelB}, labels)
+		assert.Empty(t, labels)
 	})
 }
 

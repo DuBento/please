@@ -592,7 +592,14 @@ func (d pyDict) Keys() []string {
 }
 
 // A pyFrozenDict implements an immutable python dict.
-type pyFrozenDict struct{ pyDict }
+type pyFrozenDict struct {
+	pyDict pyDict
+}
+
+func (d pyFrozenDict) Get(key string) (pyObject, bool) {
+	v, ok := d.pyDict[key]
+	return v, ok
+}
 
 func (d pyFrozenDict) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.pyDict)
@@ -607,6 +614,36 @@ func (d pyFrozenDict) Property(scope *scope, name string) pyObject {
 
 func (d pyFrozenDict) IndexAssign(index, value pyObject) {
 	panic("dict is immutable")
+}
+
+func (d pyFrozenDict) Len() int {
+	return d.pyDict.Len()
+}
+
+func (d pyFrozenDict) Operator(operator Operator, operand pyObject) pyObject {
+	return d.pyDict.Operator(operator, operand)
+}
+
+func (d pyFrozenDict) Keys() []string {
+	return d.pyDict.Keys()
+}
+
+func (d pyFrozenDict) IsTruthy() bool {
+	return d.pyDict.IsTruthy()
+}
+
+func (d pyFrozenDict) String() string {
+	return d.pyDict.String()
+}
+
+// Type implements [pyObject].
+func (d pyFrozenDict) Type() string {
+	return d.pyDict.Type()
+}
+
+// TypeTag implements [pyObject].
+func (d pyFrozenDict) TypeTag() int32 {
+	return d.pyDict.TypeTag()
 }
 
 type pyFunc struct {

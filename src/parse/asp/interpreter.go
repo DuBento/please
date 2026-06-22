@@ -24,7 +24,7 @@ type interpreter struct {
 	scope  *scope
 	parser *Parser
 	// subincludes caches the symbols for each subincluded target to avoid multiple interpreter runs.
-	subincludes *cmap.ErrMap[core.BuildLabel, symbolStore]
+	subincludes *cmap.ErrMap[core.BuildLabel, pyFrozenDict]
 	asts        *cmap.ErrMap[string, []*Statement]
 	// preloaded is a set to register all preloaded symbols.
 	preloaded *cmap.Map[string, struct{}]
@@ -66,7 +66,7 @@ func newInterpreter(state *core.BuildState, p *Parser) *interpreter {
 		i.asts = p.interpreter.asts
 		i.preloaded = p.interpreter.preloaded
 	} else {
-		i.subincludes = cmap.NewErrMap[core.BuildLabel, symbolStore](cmap.SmallShardCount, core.HashBuildLabel, i.limiter)
+		i.subincludes = cmap.NewErrMap[core.BuildLabel, pyFrozenDict](cmap.SmallShardCount, core.HashBuildLabel, i.limiter)
 		i.asts = cmap.NewErrMap[string, []*Statement](cmap.SmallShardCount, cmap.XXHash, i.limiter)
 		i.preloaded = cmap.New[string, struct{}](cmap.SmallShardCount, cmap.XXHash)
 	}
@@ -110,7 +110,9 @@ func (i *interpreter) LoadBuiltins(filename string, contents []byte, statements 
 	case "config_rules.build_defs":
 		defer setNativeCode(s, "select", selectFunc)
 	}
-	defer i.scope.SetAll(s.Freeze(), true)
+	defer func() {
+		i.scope.SetAll(s.Freeze().(pyFrozenDict), true)
+	}()
 	if statements != nil {
 		_, err := i.interpretStatements(s, statements)
 		return err
@@ -167,7 +169,6 @@ func (i *interpreter) preloadSubinclude(s *scope, label core.BuildLabel) (err er
 	s.interpreter.loadPluginConfig(s, includeState)
 	for _, out := range t.FullOutputs() {
 		s.interpreter.Subinclude(s, out, t.Label, true)
-		s.Subinclude(&label)
 	}
 	return nil
 }
@@ -240,12 +241,12 @@ func (i *interpreter) interpretStatements(s *scope, statements []*Statement) (re
 
 // Subinclude returns the global values corresponding to subincluding the given file.
 func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildLabel, preload bool) {
-	_, err := i.subincludes.GetOrSet(label, func() (symbolStore, error) {
+	symbols, err := i.subincludes.GetOrSet(label, func() (pyFrozenDict, error) {
 		pprof.SetGoroutineLabels(pprof.WithLabels(pkgScope.ctx, pprof.Labels("subinclude", path)))
 		defer pprof.SetGoroutineLabels(pkgScope.ctx)
 		stmts, err := i.parseSubinclude(path)
 		if err != nil {
-			return symbolStore{}, err
+			return pyFrozenDict{}, err
 		}
 
 		mode := pkgScope.mode
@@ -262,19 +263,19 @@ func (i *interpreter) Subinclude(pkgScope *scope, path string, label core.BuildL
 
 		if !mode.IsPreload() {
 			if err := i.preloadSubincludes(s); err != nil {
-				return symbolStore{}, err
+				return pyFrozenDict{}, err
 			}
 		}
 		s.interpretStatements(stmts)
-		symbols := s.Freeze()
+		symbols := s.Freeze().(pyFrozenDict)
 		if s.config.overlay == nil {
-			delete(symbols.locals, "CONFIG") // Config doesn't have any local modifications
+			delete(symbols.pyDict, "CONFIG") // Config doesn't have any local modifications
 		}
 
 		return symbols, nil
 	})
 	pkgScope.Assert(err == nil, "failed to subinclude %s: %s", label, err)
-	pkgScope.Subinclude(&label)
+	pkgScope.SetAll(symbols, false)
 }
 
 // parseSubinclude parses a subinclude to an AST, caching it (globally)
@@ -320,36 +321,13 @@ type parseTarget struct {
 
 type symbolStore struct {
 	locals      pyDict
-	subincluded []*core.BuildLabel
+	subincluded []core.BuildLabel
 }
 
 func newSymbolStore() symbolStore {
 	return symbolStore{
 		locals: map[string]pyObject{},
 	}
-}
-
-func (ss *symbolStore) localLookup(name string) pyObject {
-	if obj, present := ss.locals[name]; present {
-		return obj
-	}
-	return nil
-}
-
-func (ss *symbolStore) subincludedLookup(scope *scope, name string) (object pyObject, origin *core.BuildLabel) {
-	// Reverse, prioritise later additions to allow redefinition.
-	for i := len(ss.subincluded) - 1; i >= 0; i-- {
-		label := ss.subincluded[i]
-		symbols, err := scope.interpreter.subincludes.Get(*label)
-		scope.Assert(err == nil, "failed to lookup symbol %s in subinclude %s: %s", name, label, err)
-		if obj := symbols.localLookup(name); obj != nil {
-			return obj, label
-		}
-		if object, origin = symbols.subincludedLookup(scope, name); object != nil {
-			return object, origin
-		}
-	}
-	return nil, nil
 }
 
 // A scope contains all the information about a lexical scope.
@@ -366,10 +344,10 @@ type scope struct {
 	parent *scope
 	// caller points to the scope that initiated the call which created this scope.
 	// It is used to trace the call stack and is nil if not in a call stack.
-	caller  *scope
-	symbols symbolStore
-	config  *pyConfig
-	globber *fs.Globber
+	caller   *scope
+	symbols  symbolStore
+	config   *pyConfig
+	globber  *fs.Globber
 	// True if this scope is for a pre- or post-build callback.
 	Callback bool
 	mode     core.ParseMode
@@ -535,41 +513,23 @@ func (s *scope) Lookup(name string) pyObject {
 }
 
 func (s *scope) OptionalLookup(name string) pyObject {
-	obj, orig := s.lookupWithOrigin(name)
-
-	s.metadata.pushSymbol(name, orig)
+	obj := s.lookupWithOrigin(name)
+	if s.metadata != nil {
+		orig := s.metadata.origin(s, name)
+		s.metadata.pushSymbol(name, orig)
+	}
 	return obj
 }
 
 // lookup implements the recursive lookup over parent scopes.
-func (s *scope) lookupWithOrigin(name string) (object pyObject, origin *core.BuildLabel) {
-	if object = s.recLocalLookup(name); object != nil {
-		return object, nil
-	} else if object, origin = s.recSubincludedLookup(name); object != nil {
-		return object, origin
-	}
-	return nil, nil
-}
-
-func (s *scope) recLocalLookup(name string) pyObject {
-	fmt.Printf("Lookup of %s. Local symbols for %s: %v\n", name, s.pkgFilename(), s.symbols.locals)
-	if obj := s.symbols.localLookup(name); obj != nil {
+func (s *scope) lookupWithOrigin(name string) pyObject {
+	if obj, present := s.symbols.locals[name]; present {
 		return obj
 	}
 	if s.parent != nil {
-		return s.parent.recLocalLookup(name)
+		return s.parent.lookupWithOrigin(name)
 	}
 	return nil
-}
-
-func (s *scope) recSubincludedLookup(name string) (object pyObject, origin *core.BuildLabel) {
-	if object, origin = s.symbols.subincludedLookup(s, name); object != nil {
-		return object, origin
-	}
-	if s.parent != nil {
-		return s.parent.recSubincludedLookup(name)
-	}
-	return nil, nil
 }
 
 // LocalScopeLookup looks up a variable name in the current scope.
@@ -587,37 +547,33 @@ func (s *scope) Set(name string, value pyObject) {
 
 // SetAll sets all contents of the given dict in this scope.
 // Optionally it can filter to just public objects (i.e. those not prefixed with an underscore)
-func (s *scope) SetAll(ss symbolStore, publicOnly bool) {
-	for k, v := range ss.locals {
+func (s *scope) SetAll(d pyFrozenDict, publicOnly bool) {
+	for k, v := range d.pyDict {
 		if k == "CONFIG" {
 			// Special case; need to merge config entries rather than overwriting the entire object.
 			c, ok := v.(*pyFrozenConfig)
 			s.Assert(ok, "incoming CONFIG isn't a config object")
 			s.config.Merge(c)
 		} else if !publicOnly || k[0] != '_' {
-			fmt.Printf("In %s - setting %s:%v\n", s.pkgFilename(), k, v)
 			s.symbols.locals[k] = v
 		}
 	}
-	for _, label := range ss.subincluded {
-		s.symbols.subincluded = append(s.symbols.subincluded, label)
-	}
-}
-
-func (s *scope) Subinclude(label *core.BuildLabel) {
-	fmt.Printf("In %s - subincluding %s\n", s.pkgFilename(), label)
-	s.symbols.subincluded = append(s.symbols.subincluded, label)
 }
 
 // Freeze freezes the contents of this scope, preventing mutable objects from being changed.
 // It returns the newly frozen set of locals.
-func (s *scope) Freeze() symbolStore {
+func (s *scope) Freeze() pyObject {
+	frozen := pyDict{}
 	for k, v := range s.symbols.locals {
 		if f, ok := v.(freezable); ok {
-			s.symbols.locals[k] = f.Freeze()
+			frozen[k] = f.Freeze()
+		} else {
+			frozen[k] = v
 		}
 	}
-	return s.symbols
+	return pyFrozenDict{
+		pyDict: frozen,
+	}
 }
 
 // LoadSingletons loads the global builtin singletons into this scope.
